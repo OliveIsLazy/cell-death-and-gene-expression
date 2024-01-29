@@ -1,0 +1,1241 @@
+---
+title: "P2 Enrichment"
+author: "Olive Kirk"
+date: "30/06/2022"
+output: pdf_document
+---
+
+Enrichment analysis of the differential gene analysis data. Exports csv of each method's results per gene.
+
+
+# Imports
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+# Import libraries.
+
+knitr::opts_chunk$set(echo = TRUE)
+
+# Core computational packages.
+library(data.table)
+library(matrixStats)
+library(EnrichmentBrowser)
+library(rWikiPathways)
+library(limma)
+library(made4)
+library(stats)
+
+# Visualisation packages.
+# library(ggplot2)
+# library(ggfortify)
+library(ComplexHeatmap)
+
+# Coding preference packages.
+library(readr)
+library(tibble)
+library(pathview)
+library(enrichplot)
+
+library(base)
+
+
+set.seed(42)
+options("scipen"=10, "digits"=4)
+time_date <- paste0(Sys.Date(), "--", format(Sys.time(), "%H-%M-%S--"))
+
+folder = ""
+#folder = "_up_reg"
+#folder = "_down_reg"
+
+```
+
+```{r}
+
+# Define functions.
+
+# Transpose matrix and retain the name values.
+t_pose <- function(d) {
+  df_t <- transpose(d)
+  rownames(df_t) <- colnames(d)
+  colnames(df_t) <- rownames(d)
+  d <- df_t
+  
+  return(d)
+}
+
+```
+
+
+## db imports
+
+```{r}
+
+get_wikipathways <- function(species="Mus musculus") {
+  
+  # Get metadata.
+  pw <- listPathways(species)
+  
+  # Compile pathways.
+  gs <- list()
+  for (i in pw$id)
+  {
+    #gs <- list(unlist(gs), getXrefList(i, "L"))
+    #print(i)
+    gs[[length(gs)+1]] <- getXrefList(i, "L")
+  }
+  
+#  gs <- list(unlist(gs))
+  
+  # Assign names.
+  names(gs) <- pw$name
+  
+  return(gs)
+}
+
+```
+
+```{r}
+
+get_reactome <- function(){
+  
+  cpdb <- read.csv("data/CPDB_pathways_genes.csv", sep="\t")
+  db <- cpdb[cpdb$source == "Reactome",]
+  
+  # Compile pathways.
+  gs <- list()
+  for (i in 1:dim(db)[1])
+  {
+    gs[[length(gs)+1]] <- unlist(strsplit(db$entrez_gene_ids[i], ","))
+  }
+  
+  # Assign names.
+  names(gs) <- db$pathway
+  
+  return(gs)
+}
+
+```
+
+```{r}
+
+get_mousecyc <- function(){
+  
+  cpdb <- read.csv("data/CPDB_pathways_genes.csv", sep="\t")
+  db <- cpdb[cpdb$source == "MouseCyc",]
+  
+  # Compile pathways.
+  gs <- list()
+  for (i in 1:dim(db)[1])
+  {
+    gs[[length(gs)+1]] <- unlist(strsplit(db$entrez_gene_ids[i], ","))
+  }
+  
+  # Assign names.
+  names(gs) <- db$pathway
+  gs <- gs[-202]
+  
+  return(gs)
+}
+
+```
+
+## dataframes
+
+```{r} 
+# {r, echo=FALSE, warning=FALSE, message=FALSE}
+# Import data.
+
+time_date <- paste0("rep--", time_date)
+df <- read_csv("P1_outputs/df_rep.csv")
+rownames(df) <- df$ensembl_gene_id
+names(df)[names(df) == "ensembl_gene_id"] <- "ENSEMBL"
+
+print(df)
+
+```
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+
+# Split into two data frames for convenience. 
+# One for the samples (df_sam) and other for the generated statistics (df_rep).
+col.cutoff <- which(colnames(df) %in% "Apoptosis_control_1")
+df_rep <- df[,c(1:(col.cutoff-1))]
+df_sam <- df[,c(col.cutoff:length(colnames(df)))]
+df_rep <- as.data.frame(df_rep)
+df_sam <- t_pose(df_sam)
+rownames(df_rep) <- df_rep$ENSEMBL
+colnames(df_sam) <- df_rep$ENSEMBL
+
+rm(df)
+
+print(df_sam)
+print(df_rep)
+
+# Filter out what we consider to be noisy genes.
+cutoff <- 500
+keep <- colSums(df_sam > cutoff) > 0
+
+```
+
+``` {r} 
+
+# Check for any missing values.
+print(paste("Number of missing values for rep in total:  ", sum(is.na(df_rep))))
+print(paste("Number of missing values for sam in total:  ", sum(is.na(df_sam))))
+print(paste("Number of samples with negative values:     ", ncol(df_sam[colSums(df_sam < 0)])))
+print("")
+
+# Check the success of the ensemble to entrez id conversion
+print(paste("Number of missing ENTREZ values in total:  ", sum(is.na(df_rep$ENTREZID))))
+print(paste("Number of missing filtered ENTREZ values:  ", sum(is.na(df_rep[keep,]$ENTREZID))))
+
+```
+
+```{r}
+# Create corresponding dataframes where the Entrez ID is the pivotal value.
+
+# Grab indices for the duplicate.
+dup = data.frame(entrez=c(27366, 108143, 67118, 677884, 12050, 241303, 18861, 100503949, 100043915, 50518, 100303747, 257665, 75015, 71138, 545611, 108168524, 70896, 625210, 107723, 170942, 100039014), n=NA, i=NA, r=NA)
+
+for(j in 1:dim(dup)[1])
+{
+  # Assemble metadata
+  dup$i[j] <- list(which(df_rep$ENTREZID == dup$entrez[j])) # Duplicate indices.
+  dup$n[j] <- length(unlist(dup$i[j])) # Number of duplicate indices.
+  dup$r[j] <- list(dup$i[[j]][-1]) # Indices to be removed (everything but the first occurrence).
+                   
+  # View their varying values.
+  # print(df_rep[unlist(dup$i[j]), c(1:7,18)])
+  # print(df_rep[unlist(dup$i[j]), c(1:2,13:17,20)])
+}
+
+# Swap the "second is best" options around.
+j <- c(75015, 170942)
+for(k in j)
+{
+  k <- which(dup$entrez == k)
+  
+  # Sanity check.
+  if (dup$n[k] != 2){
+    print("ERROR WITH METHOD: LENGTH IS", dup$n[k]) }
+    
+  # Swap.
+  dup$i[k] <- list(unlist(rev(dup$i[[k]])))
+  dup$r[k] <- list(dup$i[[k]][-1])
+}
+
+# Eliminate the NA Entrez IDs and the duplicate entries.
+v <- unname(!colSums(is.na(t_pose(df_rep))) > 0)
+v[c(unlist(dup$r))] <- FALSE
+#v <- sort(v[c(unlist(dup$r))])
+
+
+df_rep_e <- df_rep[v, ] 
+df_sam_e <- df_sam[ ,v]
+rownames(df_rep_e) <- df_rep_e$ENTREZID
+colnames(df_sam_e) <- df_rep_e$ENTREZID
+
+write.csv(df_rep_e, "P2_outputs/processed P1 results.csv", row.names=FALSE)
+
+print(df_sam_e)
+print(df_rep_e)
+
+#rm(j, v)
+
+```
+
+
+```{r}
+# Set stuff for upreg and downreg runs.
+# You can't change it for the whole dataset since we must separate per experiment.
+
+if (folder == "_up_reg"){
+  ar <- !df_rep_e$upreg.a
+  cr <- !df_rep_e$upreg.c
+} else if (folder == "_down_reg"){
+  ar <- !df_rep_e$downreg.a
+  cr <- !df_rep_e$downreg.c
+} else {
+  ar <- rep(TRUE, length(rownames(df_rep_e))) #c( rep(TRUE, 2100), rep(FALSE, length(rownames(df_rep_e))-2100))
+  cr <- rep(TRUE, length(rownames(df_rep_e)))
+}
+  
+```
+
+
+
+# Set up
+
+```{r}
+# Choose which pathway database to use.
+
+db <- "kegg"
+#db <- "go"
+db <- "msigdb-h"
+db <- "wikipathways"
+#db <- "reactome"
+#db <- "mousecyc"
+
+if (db == "kegg") mmu.gs <- getGenesets(org="mmu", db="kegg")
+if (db == "go") mmu.gs <- getGenesets(org="mmu", db="go", onto="BP")
+if (db == "msigdb-h") mmu.gs <- getGenesets(org="mmu", db="msigdb", cat="H")
+if (db == "wikipathways") mmu.gs <- get_wikipathways()
+if (db == "reactome") mmu.gs <- get_reactome()
+if (db == "mousecyc") mmu.gs <- get_mousecyc()
+
+print(length(mmu.gs))
+
+```
+
+```{r}
+# Data setup.
+# Rows are gene IDs, columns are attributes of these biological features.
+colData <- DataFrame(GROUP=factor(rep(c("Control", "Treated"), each=3)),
+                     row.names=c("Control_1", "Control_2", "Control_3", "Treated_1", "Treated_2", "Treated_3"))
+
+
+# Sort in descending order for the apoptosis data.
+df_sam_e <- df_sam_e[, order(df_rep_e$A_log_fc, decreasing=TRUE)]
+df_rep_e <- df_rep_e[order(df_rep_e$A_log_fc, decreasing=TRUE), ]
+
+# Set the relevant indices of all or static and up/down regulated.
+ar <- rep(TRUE, length(rownames(df_rep_e))) #c( rep(TRUE, 2100), rep(FALSE, length(rownames(df_rep_e))-2100))
+if (folder == "_up_reg") ar <- !df_rep_e$downreg.a else if (folder == "_down_reg") ar <- !df_rep_e$upreg.a 
+
+# Assemble data structure for the apoptosis data.
+rowData <- data.frame(FC=df_rep_e$A_log_fc[ar], ADJ.PVAL=df_rep_e$A_padj[ar], row.names=c(df_rep_e$ENTREZID[ar]))
+se_a <- SummarizedExperiment(assays=list(raw=as.matrix(unname(t_pose(df_sam_e)[ar, 1:6])),
+                      norm=as.matrix(unname(t_pose(df_sam_e)[ar, 1:6]))), rowData=rowData, colData=colData)
+
+
+# Sort in descending order for the CICD data.
+df_sam_e <- df_sam_e[, order(df_rep_e$C_log_fc, decreasing=TRUE)]
+df_rep_e <- df_rep_e[order(df_rep_e$C_log_fc, decreasing=TRUE), ]
+
+# Set the relevant indices of all or static and up/down regulated.
+cr <- rep(TRUE, length(rownames(df_rep_e)))
+if (folder == "_up_reg") cr <- !df_rep_e$downreg.c else if (folder == "_down_reg")  cr <- !df_rep_e$upreg.c
+
+# Assemble data structure for the CICD data.
+rowData <- data.frame(FC=df_rep_e$C_log_fc[cr], ADJ.PVAL=df_rep_e$C_padj[cr], row.names=c(df_rep_e$ENTREZID[cr]))
+se_c <- SummarizedExperiment(assays=list(raw=as.matrix(unname(t_pose(df_sam_e)[cr, 13:18])),
+                      norm=as.matrix(unname(t_pose(df_sam_e)[cr, 13:18]))), rowData=rowData, colData=colData)
+
+```
+
+
+```{r}
+# df_sam_e_true <- df_sam_e
+# df_rep_e_true <- df_rep_e
+df_rep_e[order(df_rep_e$C_log_fc, decreasing=TRUE), ]
+df_sam_e[, order(df_rep_e$C_log_fc, decreasing=TRUE)]
+```
+
+
+```{r}
+
+# df_sam_e <- df_sam_e_true[, df_rep_e_true$upreg.a]
+# df_rep_e <- df_rep_e_true[df_rep_e_true$upreg.a, ]
+#   
+# # Assemble data structure for the apoptosis data.
+# rowData <- data.frame(FC=df_rep_e$A_log_fc, ADJ.PVAL=df_rep_e$A_padj, row.names=c(df_rep_e$ENTREZID))
+# se_a <- SummarizedExperiment(assays=list(raw=as.matrix(unname(t_pose(df_sam_e)[1:6])),
+#                       norm=as.matrix(unname(t_pose(df_sam_e)[1:6]))), rowData=rowData, colData=colData)
+# 
+# 
+# 
+# 
+# # Assemble data structure for the CICD data.
+# rowData <- data.frame(FC=df_rep_e$C_log_fc, ADJ.PVAL=df_rep_e$C_padj, row.names=c(df_rep_e$ENTREZID))
+# se_c <- SummarizedExperiment(assays=list(raw=as.matrix(unname(t_pose(df_sam_e)[13:18])),
+#                       norm=as.matrix(unname(t_pose(df_sam_e)[13:18]))), rowData=rowData, colData=colData)
+
+
+```
+
+
+```{r}
+
+df_rep_e
+df_rep_e[ar,]
+df_rep_e[cr,]
+# t_pose(df_sam_e)[cr, 13:18]
+# 
+# df_rep_e_true
+# df_rep_e
+# df_sam_e_true
+# df_sam_e
+
+```
+
+
+```{r}
+
+# se_a
+# (assay(se_a, 1))[1:4,]
+# rowData(se_a)
+# colData(se_a)
+
+```
+
+```{r}
+
+# se_c
+# (assay(se_c, 1))[1:4,]
+# rowData(se_c)
+# colData(se_c)
+
+```
+
+
+
+
+# Standard methods
+
+```{r}
+# Function for standardised EnrichmentBrowser EA method running via sbea.
+# https://rdrr.io/bioc/EnrichmentBrowser/src/R/sbea.R
+# !! Time recording issues need to be addressed from a permanence perspective.
+# 
+# ORA with .oraHypergeom() via [perm=0].
+# https://rdrr.io/bioc/EnrichmentBrowser/src/R/sbea.R
+# GSEA through the npGSEA package.
+# https://bioconductor.org/packages/release/bioc/html/npGSEA.html
+# GSA through the GSA package
+# https://cran.r-project.org/web/packages/GSA/index.html
+# https://rdrr.io/cran/GSA/src/R/GSA.func.R
+# GSVA through the GSVA package.
+# https://rdrr.io/bioc/GSVA/man/gsva.html
+# PADOG through the padog pacakge.
+# https://cran.r-project.org/web/packages/GSA/index.html
+# camera through the limma pacakge.
+# https://rdrr.io/bioc/limma/man/camera.html
+# roast through the limma pacakge.
+# https://rdrr.io/bioc/limma/man/roast.html
+# Global test through the GlobalTest pacakge.
+# https://www.bioconductor.org/packages/release/bioc/html/globaltest.html
+# 
+#' @param method (see sbea(...) documentation).
+#' @param dataset string for whether we are working with apoptotsis "a" or CICD "c".
+#' @param perm (see sbea(...) documentation).
+#' @param padf.method (see sbea(...) documentation).
+#' @param time boolean for whether to output time taken statements.
+eb.run <- function(method, dataset, perm=1000, padj.method="BH", time=TRUE)
+{
+  # Initialising and meta-definition.
+  if (dataset == "a") se <- se_a else se <- se_c
+  
+  # Catch the assay's GROUP formatting for GSA, GSVA and PADOG method calls.
+  if (method=="padog" | method=="gsa" | method=="gsva") colData(se)$GROUP <- as.numeric(colData(se)$GROUP)-1
+  
+  # Run enrichment method and record the time taken.
+  time_a <- Sys.time()
+  sbea.res <- sbea(method=method, se=se, gs=mmu.gs, perm=perm, padj.method=padj.method)
+  time_b <- Sys.time()
+  if (time)
+  {
+    print(paste0("The method `", method, "` was run at ", Sys.Date(), "--", format(Sys.time())))
+    print(paste0("Total time elapsed ", format(time_b-time_a)))
+  }
+  
+  # Extract information from the results and sort the tables by ascending q-value.
+  ranking.res <- gsRanking(sbea.res)
+  if (sbea.res$nr.sigs == 0) {
+    print("!! This method found ZERO significant genesets--") # else ranking.res
+  } else { 
+    sbea.res$res.tbl <- sbea.res$res.tbl[order(sbea.res$res.tbl$ADJ.PVAL, decreasing=FALSE),]
+    ranking.res <- ranking.res[order(ranking.res$ADJ.PVAL, decreasing=FALSE),]  
+  }
+  
+  # Return.
+  res <- list(sbea=sbea.res, ranking=ranking.res, 
+              metadata=list(method=chartr("a-zA-Z", "A-Za-z", method), dataset=dataset, padj.method=padj.method))
+  return(res)
+}
+
+```
+
+```{r}
+
+# Apply to the apoptosis dataset.
+a.ora <- eb.run("ora", "a", perm=0)
+a.gsea <- eb.run("gsea", "a", perm=1000)
+a.gsa <- eb.run("gsa", "a")
+a.gsva <- eb.run("gsva", "a")
+a.padog <- eb.run("padog", "a")
+a.camera <- eb.run("camera", "a")
+a.roast <- eb.run("roast", "a")
+a.globaltest <- eb.run("globaltest", "a")
+
+# a.ora$ranking
+
+```
+
+```{r}
+
+# Apply to the CICD dataset.
+c.ora <- eb.run("ora", "c", perm=0)
+c.gsea <- eb.run("gsea", "c", perm=1000)
+c.gsa <- eb.run("gsa", "c")
+c.gsva <- eb.run("gsva", "c")
+c.padog <- eb.run("padog", "c")
+c.camera <- eb.run("camera", "c")
+c.roast <- eb.run("roast", "c")
+c.globaltest <- eb.run("globaltest", "c")
+
+# c.ora$ranking
+
+```
+
+
+
+
+# Custom Methods
+
+## internal methods
+
+```{r}
+# COPY PASTED INTERNAL METHODS FROM ENRICHMENT BROWSER!!
+# https://rdrr.io/bioc/EnrichmentBrowser/src/R/sbea.R
+
+.preprocSE <- function(se)
+{
+    FC.COL <-  configEBrowser("FC.COL")
+    PVAL.COL <- configEBrowser("PVAL.COL")
+    ADJP.COL <-  configEBrowser("ADJP.COL")
+
+    if(is(se, "ExpressionSet")) se <- as(se, "SummarizedExperiment")
+
+    if(!(FC.COL %in% colnames(rowData(se)))) stop(paste("Required rowData column", FC.COL, "not found"))   
+    if(!(ADJP.COL %in% colnames(rowData(se)))) stop(paste("Required rowData column", ADJP.COL, "not found"))   
+
+    # dealing with NA's
+    se <- se[!is.na(rowData(se)[,FC.COL]),]
+    se <- se[!is.na(rowData(se)[,ADJP.COL]),]    
+
+    return(se)
+}
+
+.setAssay <- function(method, se, perm, assay = "auto")
+{
+    # reorder assays
+    if(length(assays(se)) > 1 && assay != "auto") se <- .reorderAssays(se, assay)
+    
+    # data type: ma or rseq?
+    data.type <- .detectDataType(assay(se))
+    #data.type <- "rseq"
+    metadata(se)$dataType <- data.type
+    
+    if(is.function(method)) return(se)
+    stopifnot(is.character(method))
+    
+    # works on the rowData (FC, PVAL) or the assay itself?
+    if(method == "ora" && perm == 0) method <- "ora0"
+    fdat.methods <- c("ora0", "ebm", "mgsa")
+    if(method %in% fdat.methods) return(se) 
+    
+    is.rseq <- data.type == "rseq"
+    is.raw <- method %in% c("camera", "roast", "gsva")
+    if(length(assays(se)) == 1)
+    {
+         if(!is.rseq || is.raw) return(se) 
+         se <- normalize(se, norm.method = "vst")
+    }
+    if(assay == "auto") assay <- ifelse(is.rseq && is.raw, "raw", "norm") 
+    .reorderAssays(se, assay)    
+}
+
+.reorderAssays <- function(se, assay)
+{
+    ind <- match(assay, names(assays(se)))
+    if(is.na(ind)) stop("Expression dataset (se) does not ", "contain an assay named \"", assay, "\"")
+    if(ind != 1)
+    { 
+        ind2 <- setdiff(seq_along(assays(se)), ind)
+        assays(se) <- assays(se)[c(ind, ind2)]
+    }
+    return(se)
+}
+
+.formatEAResult <- function(res, padj.method, out.file)
+{
+  PVAL.COL <- configEBrowser("PVAL.COL")
+  ADJP.COL <-  configEBrowser("ADJP.COL")
+
+  res.tbl <- data.frame(signif(res, digits=3))
+  sorting.df <- res.tbl[,ncol(res.tbl)]
+  if (ncol(res.tbl) > 1) sorting.df <- cbind(sorting.df, -res.tbl[,rev(seq_len(ncol(res.tbl)-1))]) else colnames(res.tbl)[1] <- PVAL.COL 
+  res.tbl <- res.tbl[do.call(order, as.data.frame(sorting.df)), , drop=FALSE]
+
+	if (padj.method != "none") res.tbl[[ADJP.COL]] <- p.adjust(res.tbl[[PVAL.COL]], padj.method)
+
+    res.tbl <- DataFrame(rownames(res.tbl), res.tbl)
+    colnames(res.tbl)[1] <- configEBrowser("GS.COL")
+    rownames(res.tbl) <- NULL
+
+    if(!is.null(out.file))
+    {
+        write.table(res.tbl, file=out.file, quote=FALSE, row.names=FALSE, sep="\t")
+        message(paste("Gene set ranking written to", out.file)) 
+    }
+    return(res.tbl) 
+}
+
+.detectDataType <- function(expr) 
+    ifelse(all(.isWholenumber(expr), na.rm=TRUE), "rseq", "ma")
+
+.isWholenumber <- function(x, tol=.Machine$double.eps^0.5) abs(x-round(x)) < tol
+
+```
+
+## custom methods
+
+```{r}
+# Surrogate methods mimicking EnrichmentBrowser's sbea method.
+# https://rdrr.io/bioc/EnrichmentBrowser/src/R/sbea.R
+
+
+# Extending to allow MRGSE.
+# source: https://rdrr.io/bioc/EnrichmentBrowser/src/R/sbea.R#sym-.roast.camera
+.mrgse <- function(method=c("mrgse", "cameraV1", "cameraV2", "roast"), se, gs, perm=1000, rseq=FALSE)
+{
+    method <- match.arg(method)
+
+    # design matrix
+    grp <- colData(se)[, configEBrowser("GRP.COL")]
+    blk <- NULL
+    BLK.COL <- configEBrowser("BLK.COL")
+    if(BLK.COL %in% colnames(colData(se))) blk <- colData(se)[,BLK.COL]
+   
+    group <- factor(grp)
+    paired <- !is.null(blk)
+    f <- "~" 
+    if(paired) 
+    {   
+        block <- factor(blk)
+        f <- paste0(f, "block + ") 
+    }   
+    f <- formula(paste0(f, "group"))
+    design <- model.matrix(f)
+
+    y <- assay(se)
+    # rseq data
+    if(rseq)
+    {
+        y <- edgeR::DGEList(counts=y,group=grp)
+        y <- edgeR::calcNormFactors(y)
+        y <- edgeR::estimateDisp(y, design)
+    }
+    
+    # set gene sets
+    gs.index <- limma::ids2indices(gs, rownames(se))
+    
+    # run roast / camera
+    if(method == "roast")
+        res <- limma::mroast(y, gs.index, design, nrot=perm, adjust.method="none", sort="none")
+    else if (method == "camera" || method == "cameraV1") 
+        res <- limma::camera(y, gs.index, use.ranks=FALSE, design, sort=FALSE)
+    else if (method == "cameraV2") 
+        res <- limma::camera(y, gs.index, use.ranks=TRUE,  design, sort=FALSE)
+    # run MRGSE
+    else 
+    {
+      PValue <- list()
+      NGenes <- list()
+      
+      for (gs in gs.index)
+      {
+        PVtemp <- limma::wilcoxGST(gs, rowData(se)$FC, type="t", alternative="mixed") # XXX here is the issue with MRGSE
+        # Note, we can change alternative to "either" to do a two-sided test that records direction.
+        
+        PValue <- list(unlist(PValue), PVtemp)
+        NGenes <- list(unlist(NGenes), length(gs))
+      }
+      
+      PValue <- c(unlist(PValue))
+      NGenes <- c(unlist(NGenes))
+      
+      res <- data.frame(NGenes, PValue)
+      rownames(res) <- names(gs.index)
+    }
+      
+      # mroast(y, index = NULL, design = NULL, contrast = ncol(design), geneid = NULL,
+      #  set.statistic = "mean", gene.weights = NULL, var.prior = NULL, df.prior = NULL,
+      #  nrot = 1999, approx.zscore = TRUE, legacy = FALSE, adjust.method = "BH",
+      #  midp = TRUE, sort = "directional", ...)
+    
+    if (method =="roast" || method == "camera" || method == "cameraV1" || method == "cameraV2")
+    {
+      res <- res[,c("NGenes", "Direction", "PValue")]
+      colnames(res) <- c("NR.GENES", "DIR", configEBrowser("PVAL.COL"))
+      res[,"DIR"] <- ifelse(res[,"DIR"] == "Up", 1, -1)
+    } else {
+      #res <- res[,c("NGenes", "Direction", "PValue")]
+      colnames(res) <- c("NR.GENES", configEBrowser("PVAL.COL"))
+      #res[,"DIR"] <- ifelse(res[,"DIR"] == "Up", 1, -1)
+    }
+
+    return(res)
+}
+
+
+# EXTENDING TO ALLOW PLAGE.
+.plage <- function(se, gs, rseq, method, kcdf)
+{
+  gsva <- NULL
+  isAvailable("GSVA", type="software")
+
+  # compute GSVA per sample enrichment scores
+  # kcdf <- ifelse(rseq, "Poisson", "Gaussian")
+  es <- gsva(expr=assay(se), gset.idx.list=gs, kcdf=kcdf, method=method) # XXX yo
+
+  # set design matrix
+  grp <- colData(se)[, configEBrowser("GRP.COL")]
+  blk <- NULL
+  BLK.COL <- configEBrowser("BLK.COL")
+  if(BLK.COL %in% colnames(colData(se))) blk <- colData(se)[,BLK.COL]
+
+  group <- factor(grp)
+  paired <- !is.null(blk)
+  f <- "~"
+  if(paired)
+  {
+    block <- factor(blk)
+    f <- paste0(f, "block + ")
+  }
+  f <- formula(paste0(f, "group"))
+  design <- model.matrix(f)  
+ 
+  # fit the linear model to the GSVA enrichment scores
+  fit <- limma::lmFit(es, design)
+  fit <- limma::eBayes(fit)
+  res <- limma::topTable(fit, number=nrow(es), coef="group1", sort.by="none", adjust.method="none")
+  
+  # process output
+  res <- res[,c("t", "P.Value")]
+  colnames(res) <- c("t.SCORE", configEBrowser("PVAL.COL"))
+  
+  return(res)
+}
+
+# SAFETY CHECKS, RUNS METHODS, PERFORMS MHT.
+eb.ext <- function(method, se, gs, perm, padj.method, kcdf, alpha=0.05, out.file=NULL)
+{
+  # get configuration
+  GS.MIN.SIZE <- configEBrowser("GS.MIN.SIZE")
+  GS.MAX.SIZE <- configEBrowser("GS.MAX.SIZE")
+  FC.COL <-  configEBrowser("FC.COL")
+  PVAL.COL <- configEBrowser("PVAL.COL")
+  ADJP.COL <-  configEBrowser("ADJP.COL")
+  assay <- "auto"
+
+  # TODO: disentangle DE and EA analysis
+  se <- .preprocSE(se)
+  se <- .setAssay(method, se, perm, assay)
+  
+  # data type: ma or rseq?
+  is.rseq <- (metadata(se)$dataType == "rseq")
+
+  # getting gene sets
+  if(is(gs, "GeneSetCollection")) gs <- GSEABase::geneIds(gs)
+  if(!is.list(gs)) gs <- getGenesets(gs)
+
+  # restrict se and gs to intersecting genes
+  igenes <- intersect(rownames(se), unique(unlist(gs)))
+  if(!length(igenes)) stop("Expression dataset (se)", " and ", "gene sets (gs) have no gene IDs in common")
+  se <- se[igenes,]
+  gs <- lapply(gs, function(s) s[s %in% igenes]) 
+  lens <- lengths(gs)
+  gs <- gs[lens >= GS.MIN.SIZE & lens <= GS.MAX.SIZE]
+
+  if (method == "plage" || method == "gsva") 
+    gs.ps <- .plage(se=se, gs=gs, rseq=is.rseq, method=method, kcdf=kcdf)
+  else if (method == "roast" || method == "camera" || method == "cameraV1" || method == "cameraV2" || method == "mrgse") 
+    gs.ps <- .mrgse(method=method, se=se, gs=gs, rseq=is.rseq)
+      
+  res.tbl <- .formatEAResult(gs.ps, padj.method, out.file)
+  pcol <- ifelse(padj.method == "none", PVAL.COL, ADJP.COL) 
+  res <- list(method = method, res.tbl = res.tbl, nr.sigs = sum(res.tbl[,pcol] < alpha), 
+              se = se, gs = gs, alpha = alpha)
+  
+  return(res)
+}
+  
+# Function for standardised EnrichmentBrowser EA method running via sbea.
+# https://rdrr.io/bioc/EnrichmentBrowser/src/R/sbea.R
+# !! Time recording issues need to be addressed from a permanence perspective.
+# 
+# GSVA through the GSVA package.
+# https://rdrr.io/bioc/GSVA/man/gsva.html
+# 
+#' @param method (see sbea(...) documentation).
+#' @param dataset string for whether we are working with apoptotsis "a" or CICD "c".
+#' @param padf.method (see sbea(...) documentation).
+#' @param time boolean for whether to output time taken statements.
+ss.run <- function(method, dataset, padj.method="BH", kcdf="Gaussian", time=TRUE)
+{
+  # Initialising and meta-definition.
+  if (dataset == "a") se <- se_a else se <- se_c
+  
+  colData(se)$GROUP <- as.numeric(colData(se)$GROUP)-1
+  
+  # Run enrichment method and record the time taken.
+  time_a <- Sys.time()
+  sbea.res <- eb.ext(method=method, se=se, gs=mmu.gs, perm=perm, padj.method=padj.method, kcdf=kcdf)
+  time_b <- Sys.time()
+  if (time)
+  {
+    print(paste0("The method `", method, "` was run at ", Sys.Date(), "--", format(Sys.time())))
+    print(paste0("Total time elapsed ", format(time_b-time_a)))
+  }
+  
+  # Extract information from the results and sort the tables by ascending q-value.
+  ranking.res <- gsRanking(sbea.res)
+  if (sbea.res$nr.sigs == 0) {
+    print("!! This method found ZERO significant genesets--") # else ranking.res
+  } else { 
+    sbea.res$res.tbl <- sbea.res$res.tbl[order(sbea.res$res.tbl$ADJ.PVAL, decreasing=FALSE),]
+    ranking.res <- ranking.res[order(ranking.res$ADJ.PVAL, decreasing=FALSE),]  
+  }
+  
+  # Return.
+  res <- list(sbea=sbea.res, ranking=ranking.res, 
+              metadata=list(method=chartr("a-zA-Z", "A-Za-z", method), dataset=dataset, padj.method=padj.method, kcdf=kcdf))
+  return(res)
+}
+  
+```
+
+```{r}
+
+
+```
+
+
+## comparison
+
+### plage
+
+```{r}
+# GSVA methods through an EnrichmentBrowser-clone implementation.
+
+#a.gsva <- eb.run("gsva", "a")
+a.ss.gsva.p <- ss.run("gsva", "a", kcdf="Poisson")
+a.ss.gsva.g <- ss.run("gsva", "a")
+a.ss.gsva.n <- ss.run("gsva", "a", kcdf="none")
+a.ss.plage.g <- ss.run("plage", "a")
+#a.ss.plage.n <- ss.run(method="plage", dataset="a", kcdf="none")
+
+```
+
+### mrgse
+
+```{r}
+
+a.ss.camera <- ss.run("cameraV1", "a")
+c.ss.camera <- ss.run("cameraV1", "c")
+
+```
+
+
+```{r}
+a.camera$sbea$res.tbl
+a.ss.camera$sbea$res.tbl
+```
+
+```{r}
+c.camera$sbea$res.tbl
+c.ss.camera$sbea$res.tbl
+```
+
+## applications
+
+```{r}
+
+a.plage <- a.ss.plage.g
+c.plage <- ss.run("plage", "c")
+
+a.mrgse <- ss.run("mrgse", "a")
+c.mrgse <- ss.run("mrgse", "c")
+
+a.camera.one <- ss.run("cameraV1", "a")
+a.camera.two <- ss.run("cameraV2", "a")
+c.camera.one <- ss.run("cameraV1", "c")
+c.camera.two <- ss.run("cameraV2", "c")
+
+rm (a.camera, c.camera, a.ss.camera, c.ss.camera)
+
+```
+
+
+
+
+
+# Method Comparisons
+
+## set up
+
+```{r}
+
+#' Assign names to the list entries corresponding to the EA method.
+#'
+#' 
+#' @param gs List of EnrichmentBrowser style results compilation.
+#' @param dataset.names Boolean about whether to include "a" or "c" tags.
+set.names <- function(gs, dataset.names=FALSE)
+{
+  names(gs) <- vector(, length(gs))
+  for(i in 1:length(gs))
+  {
+    names(gs)[i] <- gs[[i]]$metadata$method
+    if (dataset.names)  names(gs)[i] <- paste0(gs[[i]]$metadata$dataset, ".", names(gs)[i])
+  }
+  
+  return(gs)
+}
+
+
+#' Assemble the significant genesets, is given sorted by q-value significance.
+#' Removes any entries that have no significant genesets from the return object.
+#' Defaults to returning the genesets sorted in descending order of significance.
+#' 
+#' @param gs List of EnrichmentBrowser style results compilation.
+#' @param sort Boolean if the list should be returned sorted alphabetically.
+#' @param drop Boolean if the empty gs entries should be removed from the return product.
+get.geneset <- function(gs, sort=FALSE, drop=TRUE)
+{
+  l <- vector("list", length(gs))
+  for(i in 1:length(gs))
+  {
+    if (!is.null(gs[[i]]$ranking$GENE.SET))
+    {
+      l[i] <- list(unlist(gs[[i]]$ranking$GENE.SET))
+      names(l)[i] <- names(gs)[i]
+      if(sort==TRUE) l[i] <- sort(l[i]) 
+    }
+  }
+  if (drop==TRUE) l <- l[!sapply(l, is.null)] else names(l) <- names(gs)
+  
+  return(l)
+}
+
+
+#' Assemble the nonsignificant genesets, is given sorted by q-value significance.
+#' Defaults to returning the genesets sorted in descending order of significance.
+#' 
+#' @param gs List of EnrichmentBrowser style results compilation.
+#' @param sort Boolean if the list should be returned sorted alphabetically.
+get.deadset <- function(gs, sort=F)
+{
+  l <- vector("list", length(gs))
+  for(i in 1:length(gs))
+  {
+    a <- length(gs[[i]]$ranking$GENE.SET) + 1
+    b <- length(gs[[i]]$sbea$res.tbl$GENE.SET)
+    l[i] <- list(unlist(gs[[i]]$sbea$res.tbl$GENE.SET)[a:b])
+    names(l)[i] <- names(gs)[i]
+    if(sort==TRUE) l[i] <- sort(l[i])
+  }
+  
+  return(l)
+}
+
+
+#' Assembles the q-values after sorting by alphabetically geneset.
+#' 
+#' @param gs List of EnrichmentBrowser style results compilation.
+get.q.value <- function(gs)
+{
+  l <- vector("list", length(gs))
+  for(i in 1:length(gs))
+  {
+    # Sort the data.
+    df <- as.data.frame(gs[[i]]$sbea$res.tbl)
+    df <- df[order(df$GENE.SET),]
+    
+    # Extract the key component.
+    l[i] <- list(df$ADJ.PVAL)
+    names(l)[i] <- names(gs)[i]
+  }
+  
+  return(l)
+}
+
+```
+
+```{r}
+#' Method to get the number of shared genesets between the results of different EA methods.
+#' 
+#' @param sigsets List of EA results to be compared, such as the significant genesets found 
+#' or the q-values found.
+#' @param cutoff For choosing to compare the top X results.
+#' @param keep Which EA results to keep (enter string names).
+#' @param drop Which EA results to drop (enter string names).
+#' @param rel  Boolean if we want the overlap to be normalised by setsize rather than having absolute overlaps.
+#' @param corr Boolean if we are comparing q-value correlations, otherwise it's set overlap.
+#' @param logt Boolean if we are logtransforming the q-values, needs (corr==TRUE) to work.
+#' @param pval Boolean if we want a matrix of p-values for the correlation values, results in a binary matrix.
+make.overlapmatrix <- function (sigsets, cutoff=20, keep=c(), drop=c(), rel=TRUE, corr=FALSE, logt=FALSE, pval=FALSE)
+{
+  # For when we want to consider only specific parts of the list.
+  if (length(keep > 0)) sigsets <- sigsets[which(names(sigsets) %in% chartr("a-zA-Z", "A-Za-z", keep))]
+  
+  # For when we want to ignore the specific parts of the list.
+  if (length(drop > 0)) sigsets <- sigsets[-which(names(sigsets) %in% chartr("a-zA-Z", "A-Za-z", drop))]
+  
+  # For when all genesets found are being compared.
+  if (!is.null(cutoff)) {if (is.na(cutoff)) cutoff <- NULL else if (is.double(cutoff) & cutoff==0) cutoff <- NULL}
+  if (is.null(cutoff) | corr) cutoff <- max(unlist(lapply(sigsets, length)))
+  
+  # For when we want to log-transform the q-values.
+  if (corr==TRUE)
+  {
+    # Check that all sets of q-values are of the same length.
+    if (min(unlist(lapply(sigsets, length))) != max(unlist(lapply(sigsets, length)))) stop("q-value list lengths vary")
+    
+    # If desired, apply log-transform AND replace zeros with the smallest non-zero value (to 6 decimal places).
+    if(logt==TRUE) for (i in 1:length(sigsets)) { sigsets[i] <- list(log2(replace(sigsets[[i]], sigsets[[i]]==0, 0.000001))) }
+  
+  # For when we want to crop the data the top X most significant sets.
+  } else { for (i in 1:length(sigsets)) { sigsets[i] <- list(sigsets[[i]][1:min(cutoff, length(sigsets[[i]]))]) }  } 
+  
+  # Find the null entries and replace them with the string "None".
+  #sigsets[sapply(sigsets, is.null)] <- list(paste0(rep("None", cutoff), 1:cutoff))
+  #sigsets[sapply(sigsets, is.null)] <- list(rep("None", cutoff)) 
+  
+  # Create an overlaps matrix the quantify the overlapping sets.
+  overlap.matrix <- matrix(, nrow=length(sigsets), ncol=length(sigsets))
+  
+  for (i in c(1:length(sigsets)))
+  {
+    for (j in c(i:length(sigsets)))
+    {
+      
+      if (corr==TRUE) {
+        overlap.matrix[i,j] <- cor(sigsets[[i]], sigsets[[j]], method="pearson")
+        # spearman is log2 resistant
+        #overlap.matrix[i,j] <- cor(sigsets[[i]], sigsets[[j]], method="spearman")
+        #overlap.matrix[i,j] <- cor(sigsets[[i]], sigsets[[j]], method="kendall")
+        
+        if (pval==TRUE)
+        {
+          overlap.matrix[i,j] <- cor.test(sigsets[[i]], sigsets[[j]], method="pearson")$p.value
+          if (overlap.matrix[i,j] > 0.05) overlap.matrix[i,j] <- 1 else overlap.matrix[i,j] <- 0
+        }
+          
+        
+      } else {
+        overlap.matrix[i,j] <- length(comparelists(sigsets[[i]], sigsets[[j]])$intersect)
+        if (rel==TRUE) overlap.matrix[i,j] <- overlap.matrix[i,j] / length(unique(c(sigsets[[i]], sigsets[[j]])))
+      }
+    }
+  }
+  
+  colnames(overlap.matrix) <- names(sigsets)
+  rownames(overlap.matrix) <- names(sigsets)
+  
+  return(overlap.matrix)
+}
+
+```
+
+```{r}
+
+#' Crops and diagonalises an overlaps matrix.
+#' 
+#' @param m Diagonal matrix with the identical values and order for column and row names.
+#' @param s Crops to the left of this column/above this row (inclusive).
+crop.diag.matrix <- function(m, n)
+{
+  # Enforce idenical values and order for column names and row names
+  if (sum(rownames(m) != colnames(m)) != 0) stop("Malformed input, row and column names are not identical.")
+  
+  # Grab the index of the column or row corresponding to n.
+  if (is.character(n)) ind <- match(n, rownames(m)) else if (is.double(n)) ind <- n
+  e <- length(colnames(m))
+  
+  # Crop the matrix m to size.
+  c <-  matrix(, nrow=length(ind:e), ncol=length(ind:e))
+  colnames(c) <- colnames(m)[ind:e]
+  rownames(c) <- rownames(m)[1:(e-ind+1)]
+  
+  # Diagonalise the cropped matrix.
+  for (i in 1:(e-ind+1))
+  {
+    for (j in i:(e-ind+1))
+    {
+      c[i,j] <- m[i, (j-1+ind)]
+    }
+  }
+  
+  return(c)
+}
+
+```
+
+```{r}
+# Tidy heatmap method, simply for nicer looking code.
+# XXX rotate by 90 degrees.
+
+make.heatmap <- function (data, title="A Heatmap", name="heat I guess", col=c("red", "white", "blue")) 
+{
+  #title=character(0)
+  Heatmap( (data), name=name, col=rev(col), na_col="white", #col = heat.colors(10),
+        #col=c("lightpink", "lightpink1", "lightpink2", "lightpink3", "lightpink4"),
+        cluster_rows=FALSE, cluster_columns=FALSE,
+        row_dend_reorder=FALSE, column_dend_reorder=FALSE,
+        column_names_side="top", column_names_rot=-90,
+        row_names_gp = gpar(fontsize = 25),
+        column_names_gp = gpar(fontsize = 25),
+        show_heatmap_legend = FALSE,
+        #row_names_side="left", row_names_rot=0,
+        column_title=title)
+}
+```
+
+```{r}
+#
+
+#'
+#'
+#' @param sets A list of genesets to be compared
+#' @param diff Boolean toggling whether to return the overlap or the difference.
+#' @param bg The ultimate background set, normally "bg.set"
+get.overlaps <- function (sets, diff=FALSE, bg=bg.set)
+{
+  # Check that sets has mutliple entries.
+  if (length(sets) < 2) stop("Only one set was submitted for a multi-set comparison method.")
+  
+  # Find overlaps.
+  l <- bg
+  
+  # if (diff)  for (s in sets) { if (!is.null(s)) l <- list(unlist( comparelists(unlist(l), unlist(s))$Set.Diff )) }
+  # if (!diff) for (s in sets) { if (!is.null(s)) l <- list(unlist( comparelists(unlist(l), unlist(s))$intersect )) }
+  
+  if (diff)  for (s in sets) { l <- list(unlist( comparelists(unlist(l), unlist(s))$Set.Diff )) }
+  if (!diff) for (s in sets) { l <- list(unlist( comparelists(unlist(l), unlist(s))$intersect )) }
+  
+  l <- unlist(l)
+  #if (diff) l <- bg[-which(bg %in% l)]
+  
+  return(l)
+}
+  
+```
+
+```{r}
+# XXX at some point mask this with a super method, a vector to toggle which ones we include?
+# Also have the COMB involved down here somehow
+
+# Assemble the methods.
+a.sigsets.full <- list(a.ora, 
+                  a.gsea, 
+                  a.gsa, 
+                  a.padog, 
+                  a.mrgse,
+                  a.camera.one, 
+                  a.camera.two, 
+                  a.roast, 
+                  a.globaltest, 
+                  a.gsva, 
+                  a.plage)
+
+c.sigsets.full <- list(c.ora, 
+                  c.gsea, 
+                  c.gsa, 
+                  c.padog, 
+                  c.mrgse,
+                  c.camera.one, 
+                  c.camera.two, 
+                  c.roast, 
+                  c.globaltest, 
+                  c.gsva, 
+                  c.plage)
+
+b.sigsets.full <- list(a.ora, 
+                  a.gsea, 
+                  a.gsa, 
+                  a.padog, 
+                  a.mrgse,
+                  a.camera.one, 
+                  a.camera.two,
+                  a.roast, 
+                  a.globaltest, 
+                  a.gsva, 
+                  a.plage,
+                  c.ora, 
+                  c.gsea, 
+                  c.gsa, 
+                  c.padog, 
+                  c.mrgse,
+                  c.camera.one, 
+                  c.camera.two, 
+                  c.roast, 
+                  c.globaltest, 
+                  c.gsva, 
+                  c.plage)
+
+a.sigsets.full <- set.names(a.sigsets.full)
+c.sigsets.full <- set.names(c.sigsets.full)
+b.sigsets.full <- set.names(b.sigsets.full, TRUE)
+
+# Determine the top cutoff value.
+cutoff <- 20
+
+# Idk this might be handy or something.
+bg.set <- names(mmu.gs)
+method_names <- c("ora", "gsea", "gsa", "gsva", "padog", "mrgse", "camera.one", "camera.two", "roast", "globaltest", "plage")
+
+```
+
+```{r}
+# Create dataframe summarising the gene-significance overview.
+
+# ea.hits <- data_frame(names=(intersect(bg.set, b.sigsets.full$a.ora$sbea$res.tbl$GENE.SET)))
+# ea.hits$sig_count <- 0
+# 
+# for (b in b.sigsets.full)
+# {
+#   ea.hits <- add_column(ea.hits, temp=b$sbea$res.tbl$ADJ.PVAL[order(b$sbea$res.tbl$GENE.SET)])
+#   colnames(ea.hits)[ncol(ea.hits)] <- paste0(b$metadata$dataset, ".", b$metadata$method)
+#   ea.hits$sig_count <- ea.hits$sig_count + as.double(ea.hits[ncol(ea.hits)] < 0.05)
+# }
+# 
+# ea.hits
+
+```
+
+
+# Exporting EA results
+Export lists of key genesets for later.
+
+```{r}
+# Push "$sbea$res.tbl" of methods into one super CSV
+
+# Set the folder.
+fol <- paste0("P2_outputs/", db, "_results", folder)
+#fol <- substring(fol.temp, 1, nchar(fol.temp)-1)
+
+# Check for a directory.
+  if(!dir.exists(fol)){
+    dir.create(fol)
+  }
+
+# Save the results per apoptosis and CICD.
+for (i in 1:length(a.sigsets.full))
+{
+  m <- a.sigsets.full[[i]]$sbea$res.tbl
+  n <- paste0(fol,"/apoptosis_", i, "_", names(a.sigsets.full)[i], ".csv")
+  write.csv(m, n, row.names = FALSE)  
+}
+
+for (i in 1:length(c.sigsets.full))
+{
+  m <- c.sigsets.full[[i]]$sbea$res.tbl
+  n <- paste0(fol, "/CICD_", i, "_", names(c.sigsets.full)[i], ".csv")
+  write.csv(m, n, row.names = FALSE)  
+}
+
+  
+
+```
+
+

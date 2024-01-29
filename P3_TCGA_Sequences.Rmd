@@ -1,0 +1,2600 @@
+---
+title: "P2 TCGA Sequences"
+author: "Olive Kirk"
+date: "16/09/2022"
+output: pdf_document
+---
+
+Creates the transcriptional and post-transcriptional data for Entrez ID in specific pathways. 
+Generates the "significant genesets with meta data" dataframe for KEGG, MSiGDB and MouseCyc.
+Assembles 3/5`UTR lengths and cDNA strings w/processing, ARE strings w/processing, and poly(A)site data.
+
+Exports the UTR and ARE data extending the original input, as well as a cDNA dataframe for the UTR sequences.
+Also handles the DNA sequence importing from biomaRt in sets of 500 (see section "download cDNA data").
+
+
+# Imports
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+# Import libraries.
+
+knitr::opts_chunk$set(echo = TRUE)
+
+# Core computational packages.
+library(biomaRt)
+library(GeneAnswers)
+library(GenomicFeatures)
+library(stats)
+library(matrixStats)
+library(EnrichmentBrowser)
+library(rWikiPathways)
+library(org.Mm.eg.db)
+
+# Visualisation packages.
+# library(ggplot2)
+# library(ggfortify)
+# library(ComplexHeatmap)
+# library(VennDiagram)
+# library(paletteer)
+# library(RColorBrewer)
+# library(factoextra)
+# library(dendextend)
+# library(UpSetR)
+# library(made4)
+
+# Coding preference packages.
+library(readr)
+library(tibble)
+library(data.table)
+library(dplyr)
+library(stringr)
+
+
+set.seed(42)
+options("scipen"=10, "digits"=4)
+
+```
+
+## method calls
+
+```{r}
+
+# Transpose matrix and retain the name values.
+t_pose <- function(d) {
+  df_t <- transpose(d)
+  rownames(df_t) <- colnames(d)
+  colnames(df_t) <- rownames(d)
+  d <- df_t
+  
+  return(d)
+}
+
+```
+
+```{r}
+
+as.percent.abs <- function(a, b) { 
+  print(paste0(round(a*100/b, 1), "%--")) }
+
+as.percent.na <- function(a, b) { 
+  print(paste0(round(sum(is.na(a))*100/b, 1), "%--")) }
+
+as.percent.bool <- function(a, b=NULL) { 
+  print(paste0(round(sum(a)*100/length(a), 1), "%--")) }
+
+```
+
+
+```{r}
+
+get_mousecyc <- function(){
+  
+  cpdb <- read.csv("data/CPDB_pathways_genes.csv", sep="\t")
+  db <- cpdb[cpdb$source == "MouseCyc",]
+  
+  # Compile pathways.
+  gs <- list()
+  for (i in 1:dim(db)[1])
+  {
+    gs[[length(gs)+1]] <- unlist(strsplit(db$entrez_gene_ids[i], ","))
+  }
+  
+  # Assign names.
+  names(gs) <- db$pathway
+  gs <- gs[-202]
+  
+  return(gs)
+}
+
+```
+
+```{r}
+
+#' Short hand method for generating a boolean list.
+exp.bool <- function(df, df.gs, exp, db=NULL, dir=NULL) {
+  
+  if (is.null(db))  db  <- unique(df.gs$db)
+  if (is.null(dir)) dir <- unique(df.gs$dir)
+  
+  # Gather the significant genesets for the desired experiment.
+  gs <- df.gs[(df.gs$exp==exp) & (df.gs$db%in%db) & (df.gs$dir%in%dir), "GeneSet"]
+  
+  # Find their corresponding columns in df_bm.
+  # Filter it to only have the genes that are present in those columns.
+  r <- (rowSums(df[, which(colnames(df) %in% gs)])>0)
+  
+  # Return a new column denoting those genes as significant for that experiment.
+  return(r)
+  
+}
+
+```
+
+```{r}
+
+#' Simple method for grabbing the currently saved df_bm file.
+import.df_bm <- function(df) {
+  
+  df <- as.data.frame(read_csv("P3_outputs/conversion_table.csv"))
+  #df <- as.data.frame(read_csv("P3_outputs/conversion_table_postARED.csv"))
+  #df <- as.data.frame(read_csv("P3_outputs/conversion_table_postAREDtwo.csv"))
+  rownames(df) <- df$...1
+  df <- df[, -1]
+  
+  df$entrezgene_id <- as.character(df$entrezgene_id)
+  
+  return (df)
+}
+
+```
+
+
+```{r}
+
+#' Find the number of AT and GC bases in a cDNA or RNA string.
+base_proportions <- function(seq, RNA=FALSE, verbose=FALSE, fraction=TRUE, onlyGC=TRUE)
+{
+  # Type handling.
+  seq <- as.character(seq)
+  if (RNA) T <- "U" else T <-"T"
+  
+  # Grab TA and GC proportions.
+  prop <- c(str_count(seq, "A")+str_count(seq, T), str_count(seq, "G")+str_count(seq, "C"))
+  if (fraction) prop <- prop / str_length(seq)
+  names(prop) <- c(paste0("A", T), "GC")
+  
+  
+  # Print total distribution (optional).
+  if (verbose)
+  {
+    # Print absolute proportions.
+    print(paste0("Number of occurances of ", T,": ", str_count(seq, T))) # RNA: A.
+    print(paste0("Number of occurances of A: ", str_count(seq, "A"))) # RNA: U.
+    print(paste0("Number of occurances of C: ", str_count(seq, "C"))) # RNA: G.
+    print(paste0("Number of occurances of G: ", str_count(seq, "G"))) # RNA: C.
+    
+    # Print relative proportions.
+    print(paste0("Proportion of ", T," bases: ", round(str_count(seq, T)*100/str_length(seq), 1), "%")) 
+    print(paste0("Proportion of A bases: ", round(str_count(seq, "A")*100/str_length(seq), 1), "%")) 
+    print(paste0("Proportion of C bases: ", round(str_count(seq, "C")*100/str_length(seq), 1), "%")) 
+    print(paste0("Proportion of G bases: ", round(str_count(seq, "G")*100/str_length(seq), 1), "%")) 
+    
+    print(paste0("Total occurances is: ", str_length(seq)))
+  }
+  
+  
+  if (!onlyGC) 
+    return(prop)
+  return(prop["GC"])
+}
+
+```
+
+```{r}
+
+#' Find a specific base sequence in a character sequence.
+#' #' Defaults to finding the frequenct counts of poly(A) sites in DNA (AATAAA).
+#' 
+#' count: For when the user wants to get a frequency count of code in seq
+#' pos.list:  For when the user wants to get the starting positions of code in seq
+seq.search <- function(seq, code=NA, RNA=FALSE, count=TRUE, pos.list=FALSE)
+{
+  # Check if a count of occurrences or list of positions is being requested.
+  if (count & pos.list) stop("USER ERROR: Cannot request both frequency count and base positions.--")
+  if (!(count & pos.list)) stop("USER ERROR: Cannot request neither frequency count and base positions.--")
+    
+  # Type handling.
+  seq <- as.character(seq)
+  if (RNA) T <- "U" else T <-"T"
+  if (is.na(code)) code <- paste0("AA", T, "AAA")
+  code <- as.character(code)
+  
+  # Count: frequency search.
+  # XXX regex for a one-base variant.
+  if(count) res <- c(count=str_count(seq, code))
+  
+  # List: positional search and indicies.
+  if(pos.list)
+  {
+    #
+    
+    # Identify how far down the full sequence the start position is (as a percentage).
+  }
+  
+  return(res)
+}
+
+```
+
+```{r}
+
+# Basic function to convert human to mouse gene names
+# source: https://www.r-bloggers.com/2016/10/converting-mouse-to-human-gene-names-with-biomart-package/
+gene.names.human2mouse <- function(x){
+  
+  # Gather bio-info marts.
+  human = useMart("ENSEMBL_MART_ENSEMBL", dataset="hsapiens_gene_ensembl", host="dec2021.archive.ensembl.org")
+  mouse = useMart("ENSEMBL_MART_ENSEMBL", dataset="mmusculus_gene_ensembl", host="dec2021.archive.ensembl.org")
+  
+  # Compare them against one another to create the mapping.
+  y <- getLDS(attributes = c("hgnc_symbol"), mart=human, filters="hgnc_symbol", 
+              values=x,
+              attributesL=c("mgi_symbol"), martL=mouse)
+  
+  return(y)
+}
+
+```
+
+```{r}
+# Helper methods for handling multiple AREs across the two dataframes.
+
+#' Tidies up the row updating process.
+are.value.update <- function(row, ind, UTR) {
+  
+  if (UTR)
+  {
+    row$ared.utr <- ind
+    row$gc.proportion <- base_proportions(df.are.utr[ind, "Pattern"])
+    row$seq.length    <- str_length(df.are.utr[ind, "Pattern"])
+  }
+  if (!UTR)
+  {
+    row$ared.itr <- ind
+    row$gc.proportion <- base_proportions(df.are.itr[ind, "Pattern"])
+    row$seq.length    <- str_length(df.are.itr[ind, "Pattern"])
+  }
+  
+  return(row)
+  
+}
+
+#' Loops over the multiple indices j associated with the ith row of df.
+#' Boolean toggle for 3`UTR or intron database in the value-update call.
+#' Creates and attaches duplicate rows as necessary.
+are.multi.loop <- function(df, i, j, UTR) {
+  
+  # Duplicate the singular row in df for modification.
+  row_base <- df[i, ]
+  h <- 1
+  
+  # For each entry, working backwards...
+  for (m in j)
+  {
+    # ...set up the df row to be modified...
+    # ...then update it to have the 3`UTR index and the associated ARE's GC proportion and sequence length...
+    row_temp <- are.value.update(row_base, m, UTR)
+    
+    # ...before finally adding it back into df! (at the end)
+    df <- add_row(df, row_temp)
+    rownames(df)[nrow(df)] <- paste0(row.names(row_base), ".", h)
+    h <- h + 1
+  }
+  
+  # Modify the original base row to be dropped for later.
+  df[i, "drop"] <- TRUE
+  
+  return(df)
+}
+
+```
+
+```{r}
+# Handling the duplicate-row issue for processing each feature.
+
+#' Finds out which duplicated rows in df share the same value wrt feature f.
+#' This method is to be used for t-test comparisons to prevent bias from duplicates.
+#' Return value is used to filter for duplicated rows with varying feature values.
+#' 
+#' df   dataframe
+#' f    feature to be checked for duplicates
+#' return a dataframe of two boolean columns, one for duplicate rows and
+#'      one for duplicate rows with identical values.
+dup_feature <- function(df, f) {
+  
+  df$double <- FALSE
+  df$dup    <- FALSE
+  
+  for (i in c(1:nrow(df)))
+  {
+    # Find which rows are duplicate rows.
+    j <- which(df$entrezgene_id %in% df$entrezgene_id[i])
+    
+    # Check if these are duplicated based on the desired feature.
+    if (length(j) > 1)
+      df$double[i] <- TRUE
+    if ((df$double[i]) & (length(unique(df[j, f])) == 1))
+        df$dup[i] <- TRUE
+  }
+  
+  return (df[, c("double", "dup")])
+}
+
+```
+
+
+
+
+# Conversion Table
+Creating a dataframe between EntrezIDs, RefSeq IDs, the gene features, and the geneset boolean columns.
+
+```{r}
+# Allow conversion between RefSeq IDs and Entrez IDs
+# Source: https://www.biostars.org/p/379962/
+
+# Get the conversion table.
+mart <- useMart("ENSEMBL_MART_ENSEMBL", dataset="mmusculus_gene_ensembl", host="https://www.ensembl.org")
+#attributes <- c("entrezgene_id", "refseq_mrna", "refseq_mrna_predicted", "5utr", "coding", "3utr")
+attributes <- c("entrezgene_id", "refseq_mrna", "refseq_mrna_predicted")
+BM.info <- getBM(attributes=attributes, mart=mart)
+
+# make a function to remove weird numbers in your annotation names
+trim.numbers <- function(name){ gsub("\\.[0-9]","",name) }
+
+```
+
+## Get RefSeq IDs
+Connecting the entrez-indexed dataframe to RefSeq values.
+
+```{r}
+# Connecting the standard Entrez ID format to the EnrichmentBrowser format via the BioMart info. <runs slowly>
+
+# Get EnrichmentBrowser values.
+#if (exists("mmu.gs")) mmu.genesets <- mmu.gs else mmu.genesets <- EnrichmentBrowser::getGenesets(org="mmu", db="kegg")
+if (!exists("mmu.gs")) 
+{
+  mmu.kegg <- EnrichmentBrowser::getGenesets(org="mmu", db="kegg")
+  mmu.msigdb <- EnrichmentBrowser::getGenesets(org="mmu", db="msigdb")
+  mmu.mousecyc <- get_mousecyc()
+  
+  mmu.genesets <- c(mmu.kegg, mmu.msigdb, mmu.mousecyc)
+  
+} else mmu.genesets <- mmu.gs 
+
+mmu.genes <- as.data.frame(unique(unlist(mmu.genesets)))
+colnames(mmu.genes)[1] <- "entrezgene_id"
+
+# Create a list corresponding to the BioMart's matching Entrez IDs and fill it.
+mmu.genes["match_idx"] <- NA
+
+for (g in 1:nrow(mmu.genes))
+{
+  mmu.genes[g, "match_idx"] <- match(mmu.genes[g, "entrezgene_id"], BM.info$entrezgene_id)
+}
+
+# Order by EntrezID.
+mmu.genes <- mmu.genes[order(mmu.genes$entrezgene_id),]
+
+# Declare the proportion of found and missing values.
+missing <- is.na(mmu.genes["match_idx"])
+print(paste0("The number of missing genes is ", sum(missing), "--"))
+
+```
+
+```{r}
+#mmu.genes
+#names(mmu.genesets)
+```
+
+
+```{r}
+# Create the conversion table
+
+# Copy and crop BM.info to mmu.genes only.
+df_bm <- (as.data.frame(BM.info))[mmu.genes[!missing, "match_idx"],]
+
+# If genes are missing, then extend it to include empty rows for them.
+if (sum(missing) > 0) 
+{
+  # Artificially add rows to make the binding smoother.
+  mmu.genes["refseq_mrna"] <- ""
+  mmu.genes["refseq_mrna_predicted"] <- ""
+  df_bm <- rbind(df_bm, mmu.genes[missing, c(1,3,4)])
+  
+  # Remove the artificial columns.
+  mmu.genes <- mmu.genes[,-c(3,4)]
+}
+
+# Order the conversion table by EntrezIDs (ascending).
+df_bm <- df_bm[order(df_bm$entrezgene_id),]
+
+# Extend with 344 binary columns for each of EnrichmentBrowser's mmu genesets.
+# For each geneset in mmu.gs...
+for (gs in 1:length(mmu.genesets))
+{
+  # ...add a column corresponding to it...
+  df_bm[names(mmu.genesets[gs])] <- FALSE 
+  col_idx <- ncol(df_bm)
+  
+  # ...then find which of df_bm's EntrezIDs match the ones in that mmu.gs geneset and mark them.
+  for (g in 1:length(mmu.genesets[[gs]]))
+  {
+    row_idx <- match(mmu.genesets[[gs]][g], df_bm$entrezgene_id)
+    if (!is.na(row_idx)) df_bm[row_idx, col_idx] <- TRUE else print(paste0("geneset ", names(mmu.genesets[gs]), "'s index ", g," value [", mmu.genesets[[gs]][g], "] doesn't exist!?--"))
+  }
+}
+
+df_bm
+
+```
+
+```{r}
+# Check the copying over is correct by comparing genesets' lengths.
+
+t.ind <- (which(colnames(df_bm) %in% "refseq_mrna_predicted")+1)
+
+for(col in t.ind:ncol(df_bm))
+{
+  a <- sum((df_bm[,c(col)] > 0))
+  b <- length(unlist(mmu.genesets[col-t.ind+1]))
+  if (a != b) print(paste0("issue at col.num ", col, "-- Length ", a, " versus ", b, "--"))
+  #if (a != b) print(paste0(colnames(df_bm)[col]))
+  #if (a != b) print(names(mmu.genesets[col-t.ind+1]))
+}
+
+rm(t.ind, a, b)
+
+```
+
+```{r}
+# Toggle genes that don't have a mRNA code.
+
+df_bm <- add_column(df_bm, unmatched=FALSE, .after = "refseq_mrna_predicted")
+for(row in 1:nrow(df_bm))  
+  if((df_bm$refseq_mrna[row] == "") & (df_bm$refseq_mrna_predicted[row] == ""))  
+    df_bm$unmatched[row] <- TRUE
+
+```
+
+```{r}
+# Show results.
+
+mmu.genes # used to build df_bm (no longer needed)
+df_bm # used as a conversion table for the mmu genesets
+#df # transcriptional data per RNA ID for all Biomark genes
+
+print(paste0("Number of total mmu gene entries:  ", nrow(mmu.genes)))
+print(paste0("Number of conversion gene entries: ", sum(!is.na(mmu.genes["entrezgene_id"]))))
+print(paste0("Number of gene-mRNA entry matches: ", sum(!is.na(mmu.genes["match_idx"]))))
+print(paste0("Number of gene-mRNA value matches: ", sum(!df_bm$unmatched)))
+print(paste0("Number of missing EntrezIDs from df_bm: ", sum(is.na(mmu.genes["match_idx"]))))
+print(paste0("Number of missing mRNAs IDs from df_bm: ", sum(df_bm$unmatched)))
+
+```
+
+
+## Metadata attachment
+
+```{r}
+# Attach gene names to the conversion table (EntrezID to GeneSymbol)
+
+gene_symbols <- getSymbols(as.character(df_bm$entrezgene_id), "org.Mm.eg.db", strict=FALSE, missing="keep")
+df_bm <- add_column(df_bm, gene_symbols=gene_symbols, .before="entrezgene_id")
+
+
+# Proportion of unmatched gene IDs.
+
+print(paste0("The amount of unmatched gene symbol lengths is ", sum(is.na(df_bm$`gene_symbols`)), " (", round(sum(is.na(df_bm$`gene_symbols`))*100/nrow(df_bm),1), "%)--"))
+
+df_bm
+
+```
+
+```{r}
+# Append boolean columns for which genes belong to significantly enriched genesets.
+
+if (FALSE)
+{
+  l.col <- which(colnames(df_bm) %in% "unmatched")
+  
+  if(!exists("df.sigsets")) df.sigsets <- as.data.frame(read_csv("P3_outputs/sigset.met.metadata.csv"))
+    
+  df_bm <- add_column(df_bm, a.u=exp.bool(df_bm, df.sigsets, exp="apoptosis", dir="up"),    .before=l.col+1)
+  df_bm <- add_column(df_bm, c.u=exp.bool(df_bm, df.sigsets, exp="cicd",      dir="up"),    .before=l.col+2)
+  df_bm <- add_column(df_bm, a.d=exp.bool(df_bm, df.sigsets, exp="apoptosis", dir="down"),  .before=l.col+3)
+  df_bm <- add_column(df_bm, c.d=exp.bool(df_bm, df.sigsets, exp="cicd",      dir="down"),  .before=l.col+4)
+  df_bm <- add_column(df_bm, a.m=exp.bool(df_bm, df.sigsets, exp="apoptosis", dir="mixed"), .before=l.col+5)
+  df_bm <- add_column(df_bm, c.m=exp.bool(df_bm, df.sigsets, exp="cicd",      dir="mixed"), .before=l.col+6)
+}
+
+df_bm
+  
+```
+
+```{r}
+df_bm.safe <- df_bm
+```
+
+
+```{r}
+# Import DGA results for up- and down-regulation booleans.
+
+df.genes <- as.data.frame(read_csv("P1_outputs/df_rep_genelist.csv"))
+
+# Crop it to just the differentially expressed gene toggles.
+df.genes <- df.genes[, c(which(colnames(df.genes) %in% "ENTREZID"),
+             which(colnames(df.genes) %in% "upreg.a"),
+             which(colnames(df.genes) %in% "upreg.c"),
+             which(colnames(df.genes) %in% "downreg.a"),
+             which(colnames(df.genes) %in% "downreg.c"))]
+
+# Append then set static boolean columns.
+df.genes <- add_column(df.genes, static.a = TRUE, .after="downreg.c")
+df.genes <- add_column(df.genes, static.c = TRUE, .after="static.a")
+
+df.genes[df.genes$upreg.a,   "static.a"] <- FALSE
+df.genes[df.genes$downreg.a, "static.a"] <- FALSE
+df.genes[df.genes$upreg.c,   "static.c"] <- FALSE
+df.genes[df.genes$downreg.c, "static.c"] <- FALSE
+
+df.genes 
+
+# Reorganise df.genes to match, makes the search faster.
+# df.genes.idx <- sort(as.character(df.genes$ENTREZID))
+# df.genes.idx <- df.genes.idx[which(df.genes.idx %in% df_bm$entrezgene_id)]
+
+df_bm <- df_bm.safe
+l.col <- which(colnames(df_bm) %in% "c.m")
+if (length(which(colnames(df_bm) %in% "upreg.a")) == 0)
+{
+  df_bm <- add_column(df_bm, upreg.a=0,   .before=l.col+1)
+  df_bm <- add_column(df_bm, upreg.c=0,   .before=l.col+2)
+  df_bm <- add_column(df_bm, downreg.a=0, .before=l.col+3)
+  df_bm <- add_column(df_bm, downreg.c=0, .before=l.col+4)
+  df_bm <- add_column(df_bm, static.a=0,  .before=l.col+5)
+  df_bm <- add_column(df_bm, static.c=0,  .before=l.col+6)
+  df_bm <- add_column(df_bm, gene.idx=0,  .before=l.col+7)
+}
+
+for (i in c(1:nrow(df_bm)))
+{
+  j <- which(df.genes$ENTREZID %in% df_bm$entrezgene_id[i])
+  if (length(j) > 0)
+  {
+    if (length(j) > 1)
+      stop(paste0("i: ", i, ", j: ", j))
+    df_bm$gene.idx[i] <- j
+    
+    df_bm[i, which(colnames(df_bm) %in% "upreg.a"):which(colnames(df_bm) %in% "static.c")] <- 
+      df.genes[j, which(colnames(df.genes) %in% "upreg.a"):which(colnames(df.genes) %in% "static.c")]
+  }
+}
+
+rm(df.genes, df.genes.idx)
+df_bm
+
+```
+
+
+
+## Get 3`UTRs
+
+```{r}
+# Stolen code grabbing transcriptional mRNA data about genes from Ensembl Biomart.
+# Source: https://www.biostars.org/p/4869/
+
+# When there are too many connections to download the UCSC: $ sudo service mysql stop
+
+#RefSeq             <- makeTxDbFromUCSC(genome="mm10", tablename="refGene")
+#RefSeq             <- makeTxDbFromUCSC(genome="mm10")#, tablename="refGene")
+RefSeq             <- makeTxDbFromUCSC(genome="mm10", tablename="ncbiRefSeq")
+#RefSeq             <- makeTxDbFromUCSC(genome="mm10", tablename="geneid")
+
+```
+
+
+### connecting
+Connecting the RefSeq-indexed dataframe containing 3`UTR length with EntrezIDs.
+
+```{r}
+# Extract the 3`UTR lengths.
+
+threeUTRs          <- threeUTRsByTranscript(RefSeq, use.names=TRUE)
+length_threeUTRs   <- width(ranges(threeUTRs))
+the_lengths        <- as.data.frame(length_threeUTRs)
+the_lengths        <- the_lengths %>% group_by(group, group_name) %>% summarise(sum(value))
+the_lengths        <- unique(the_lengths[,c("group_name", "sum(value)")])
+colnames(the_lengths) <- c("RefSeqID", "3' UTR Length")
+
+df <- as.data.frame(the_lengths)
+rm(threeUTRs, length_threeUTRs, the_lengths)
+# rm(threeUTRs, length_threeUTRs)
+# rm(RefSeq)
+# rm(the_lengths)
+
+```
+
+```{r}
+# Linking RefSeq IDs to Entrez IDs on df. "N_" prefixed IDs are curated, "X_" prefixed IDs are not. <runs slowly>
+# Source: https://www.biostars.org/p/379962/
+# Source: https://web.mit.edu/~r/current/arch/i386_linux26/lib/R/library/org.Hs.eg.db/html/org.Hs.egREFSEQ.html
+
+
+# Add the EntrezID column.
+df <- add_column(df, EntrezID=NA, .after = "RefSeqID")
+df <- add_column(df, RefSeqID_crop=NA, .after = "RefSeqID")
+
+
+# Check if the RefSeq ID from df is curated, then match it in df_bm to get the corresponding EntrezID.
+for (r in 1:nrow(df)) 
+{
+  # Crop
+  df[r, "RefSeqID_crop"] <- trim.numbers(df[r, "RefSeqID"])
+                                  
+  # Connect each RefSeq ID to their corresponding EntrezID.
+  if (substr(df[r, "RefSeqID"], 1, 1) == "N") 
+    df[r, "EntrezID"] <- BM.info$entrezgene_id[match(df[r, "RefSeqID_crop"], BM.info$refseq_mrna)]
+  
+  if (substr(df[r, "RefSeqID"], 1, 1) == "X") 
+    df[r, "EntrezID"] <- BM.info$entrezgene_id[match(df[r, "RefSeqID_crop"], BM.info$refseq_mrna_predicted)]
+}
+
+# Order by ascending EntrezIDs.
+df[order(df$RefSeqID),]
+df <- df[order(df$EntrezID),]
+df
+
+```
+
+```{r}
+# Check for uniqueness among the RefSeqID and EntrezID columns.
+
+print(paste0("Full uniqueness in RefSeqID: ", (nrow(df) == length(unique(unlist(c(df["RefSeqID"])))) ) ))
+print(paste0("Full uniqueness in EntrezID: ", (nrow(df) == length(unique(unlist(c(df["EntrezID"])))) ) ))
+# Then both coming back FALSE reflects a many-to-many mapping between genes and mRNA.
+
+a <- sum(is.na(df["EntrezID"]))
+b <- nrow(df)
+print(paste0("There are ", a, " out of ", b, " missing entries in the EntrezID column (", round((a*100)/b, 1), "%)--"))
+rm(a, b)
+
+```
+
+```{r}
+df_bm
+```
+
+### transfering
+Connecting the entrez-indexed dataframe with the 3`UTR values from the RefSeq-indexed dataframe.
+
+```{r}
+df_bm[3300:3400, ]
+```
+
+```{r}
+# Move over the 3'UTR lengths for the curated and uncurated mRNA segments. <runs slowly>
+
+# Create curated and uncurated lengths column.
+if (length(which(colnames(df_bm) %in% "3'UTR_max")) == 0)
+{
+  df_bm <- add_column(df_bm, `3'UTR_max`=NA, .after = "entrezgene_id")
+  df_bm <- add_column(df_bm, `3'UTR_N`=NA, .after = "refseq_mrna")
+  df_bm <- add_column(df_bm, `3'UTR_X`=NA, .after = "refseq_mrna_predicted")
+}
+
+# Handling duplicated from the many-to-many mapping.
+dup_row_idx <- list()
+
+# Cycle through df_bm's EntrezIDs and grab the lengths.
+for (row in 1:nrow(df_bm))
+{
+  # In case this df_bm entry lacks a RefSeq ID, copy one over.
+  if ((df_bm$refseq_mrna[row] == "") & (df_bm$refseq_mrna_predicted[row] == ""))
+  {
+    # Get the indicies in df corresponding to the EntrezID from df_bm.
+    rs <- which(df$EntrezID %in% df_bm$entrezgene_id[row])
+
+    if (length(rs) > 0)
+    {
+      # Split the
+      t.rs <- substring(df$RefSeqID_crop[rs], 1, 1)
+      rs.n <- df[rs[t.rs == "N"], c("RefSeqID_crop", "EntrezID")]
+      rs.x <- df[rs[t.rs == "X"], c("RefSeqID_crop", "EntrezID")]
+
+      # Double sure that the RefSeq IDs do correspond to the orignal df_bm EntrezID.
+      rs.n <- rs.n$RefSeqID_crop[rs.n$EntrezID == df_bm$entrezgene_id[row]]
+      rs.x <- rs.x$RefSeqID_crop[rs.x$EntrezID == df_bm$entrezgene_id[row]]
+
+      # Find their corresponding 3`UTR lengths and their the maximum index, then assign.
+      t.rs <- which.max(df$`3' UTR Length`[which(df$RefSeqID_crop %in% rs.n)])
+      if (length(t.rs) > 0) df_bm$refseq_mrna[row] <- rs.n[t.rs]
+      t.rs <- which.max(df$`3' UTR Length`[which(df$RefSeqID_crop %in% rs.x)])
+      if (length(t.rs) > 0) df_bm$refseq_mrna_predicted[row] <- rs.x[t.rs]
+    }
+  }
+  
+  # Grab df rows where the df_bm RefSeq IDs match those in df.
+  n_type <- which(df$RefSeqID_crop %in% df_bm$refseq_mrna[row])
+  x_type <- which(df$RefSeqID_crop %in% df_bm$refseq_mrna_predicted[row])
+  
+  # In cases where there is no matching RefSeq ID, try using the EntrezID
+  if ((length(c(n_type)) == 0) & (length(c(x_type)) == 0))  
+  {
+    # Also grab the df rows based on the df_bm entrez ID, since biomaRt doesn't cover all relevant genes.
+    type.all <- which(df$RefSeqID_crop %in% df[which(df$EntrezID %in% df_bm$entrezgene_id[row]), "RefSeqID_crop"])
+    
+    for (m in type.all)
+    {
+      rs <- df$RefSeqID_crop[m]
+      
+      if (substr(rs, 1, 1) == "N")
+        if (length(which(n_type %in% m)) == 0)
+          n_type <- c(n_type, m)
+      
+      if (substr(rs, 1, 1) == "X")
+        if (length(which(x_type %in% m)) == 0)
+          x_type <- c(x_type, m)
+    }
+    
+    # I just can't handle this man :sob:
+    if ((length(c(n_type))) > 1 & (length(c(x_type)) > 1))  
+      x_type <- integer(0)  
+  }
+  
+  
+  if (length(c(n_type)) > 0)
+  {
+    # Check that the curated 3' UTR lengths are equal for each sublist, handle empty lists.
+    utr_val <- unique(unlist(df$`3' UTR Length`[c(n_type)]))
+    
+    # If there are multiple length values for curated mRNAs, record the index for later handling.
+    if(length(utr_val) > 1) dup_row_idx <- list(unlist(dup_row_idx), row)
+    
+    # If there is only one length value for curated mRNAs, save it in df_bm.
+    if(length(utr_val) == 1) 
+    {
+      df_bm$`3'UTR_N`[row] <- utr_val
+      df_bm$`3'UTR_max`[row] <- utr_val
+      if (df_bm$refseq_mrna[row] == "") 
+        df_bm$refseq_mrna[row] <-df$RefSeqID_crop[c(n_type)[1]]
+    }
+  }
+  
+  if (length(c(x_type)) > 0)
+  {
+    # Check that the curated 3' UTR lengths are equal for each sublist, handle empty lists.
+    utr_val <- unique(unlist(df$`3' UTR Length`[c(x_type)]))
+    
+    # If there are multiple length values for uncurated mRNAs, record the index for later handling.
+    if(length(utr_val) > 1) dup_row_idx <- list(unlist(dup_row_idx), row) 
+    
+    # If there is only one length value for uncurated mRNAs, save it in df_bm.
+    if(length(utr_val) == 1) 
+    {
+      df_bm$`3'UTR_X`[row] <- utr_val
+      if (is.na(df_bm$`3'UTR_max`[row])) df_bm$`3'UTR_max`[row] <- utr_val
+      if (df_bm$refseq_mrna_predicted[row] == "") 
+        df_bm$refseq_mrna_predicted[row] <-df$RefSeqID_crop[c(x_type)[1]]
+    }
+  }
+}
+
+dup_row_idx <- unique(unlist(dup_row_idx))
+
+```
+
+### handling dups
+
+```{r}
+# Handle the duplicate values, by first narrowing down the df indices per df_bm index into a single data structure.
+
+dup_vals <- list()
+
+for (dri in dup_row_idx)
+{
+  # Grab the df indicies from the df_bm label.
+  n_type <- which(df$RefSeqID_crop %in% df_bm$refseq_mrna[dri])
+  x_type <- which(df$RefSeqID_crop %in% df_bm$refseq_mrna_predicted[dri])
+  
+  # In cases where there is no matching RefSeq ID, try using the EntrezID.
+  if ((length(c(n_type)) < 2) & (length(c(x_type)) < 2))  
+  {
+    # Also grab the df rows based on the df_bm entrez ID, since biomaRt doesn't cover all relevant genes.
+    type.all <- which(df$RefSeqID_crop %in% df[which(df$EntrezID %in% df_bm$entrezgene_id[dri]), "RefSeqID_crop"])
+    
+    for (m in type.all)
+    {
+      rs <- df$RefSeqID_crop[m]
+      
+      if (substr(rs, 1, 1) == "N")
+        if (length(which(n_type %in% m)) == 0)
+          n_type <- c(n_type, m)
+      
+      if (substr(rs, 1, 1) == "X")
+        if (length(which(x_type %in% m)) == 0)
+          x_type <- c(x_type, m)
+    }
+    
+    # I just can't handle this man :sob:
+    if ((length(c(n_type))) > 1 & (length(c(x_type)) > 1))
+      x_type <- integer(0)  
+  }
+  
+  
+  # Check for double duplicates across the mRNA types.
+  if ((length(c(n_type))) > 1 & (length(c(x_type)) > 1)) stop(paste0("We got a problem here (", dri,"), cheif..."))
+  
+  # Grab the plural index (not checking if it exists because we can assume so).
+  if (length(c(n_type)) > 1) dup_vals[[dri]] <- n_type
+  if (length(c(x_type)) > 1) dup_vals[[dri]] <- x_type
+  
+  if (((length(c(n_type))) > 1 | (length(c(x_type)) > 1)) & (length(dup_vals[[dri]]) == 0)) 
+  {
+    if ((length(c(n_type))) > 1 | (length(c(x_type)) > 1)) print(dri)
+    if (length(c(n_type)) > 1) print(n_type)
+    if (length(c(x_type)) > 1) print(x_type)
+    
+    stop(paste0("We got a failed save here (", dri,"), cheif..."))
+  }
+}
+
+dup_vals <- dup_vals[c(unlist(dup_row_idx))]
+names(dup_vals) <- c(unlist(dup_row_idx))
+
+```
+
+```{r}
+# Create a duplicate row with a suffix added for the duplicated RefSeq IDs.
+# Note, R is pass-by-value ONLY.
+
+# for each duplicate
+for (d_val in names(dup_vals))
+{
+  d_idx <- as.double(d_val) # df_bm index
+  d_val <- which(names(dup_vals) %in% d_idx) # which entry in the duplicate rows list
+  d_len <- length(unlist(dup_vals[d_val])) # number of duplicate rows
+  d_val <- c(unlist(dup_vals[d_val][1])) # unlist and save for looping
+  
+  # Toggle whether this set of rows is curated duplicates or uncurated duplicates (iirc it is either-or).
+  if (!is.na(df[c(unlist(d_val[1])),]$RefSeqID[1]) & 
+      substring(df[c(unlist(d_val[1])),]$RefSeqID[1],1,2) == "NM") 
+    curated=T 
+  else curated=F
+  
+  # Duplicate the singular row in df_bm for modification.
+  row_base <- df_bm[d_idx,]
+  
+  # For each entry, working backwards...
+  for (i in 1:d_len)
+  {
+    # ...set up the df_bm row to be modified...
+    row_temp <- row_base
+    
+    # ...save the specific duplicated df row for their 3`UTR value, then with respect to curated and uncurated entries...
+    df_row <- df[d_val, "3' UTR Length"]
+    
+    # ...update it to have the UTR length, and modify the df_bm row's corresponding RefSeq name for each duplicate...
+    # ...plus updating the max column value...
+    if (curated == TRUE)
+    {
+      row_temp$"3'UTR_N" <- df_row[i]
+      row_temp$"3'UTR_max" <- row_temp$"3'UTR_N"
+      
+     } else {
+       
+      row_temp$"3'UTR_X" <- df_row[i]
+      if (is.na(row_temp$"3'UTR_max")) row_temp$"3'UTR_max" <- row_temp$"3'UTR_X"
+    }
+    
+    # ...before finally adding it back into df_bm! (at the end)
+    df_bm <- add_row(df_bm, row_temp)
+    rownames(df_bm)[nrow(df_bm)] <- paste0( row.names(row_base), ".", letters[i])
+  }
+}
+
+# Lastly, remove the initial (unmodified) row that is without any values, then re-order.
+df_bm <- df_bm[-as.double(names(dup_vals)), ]
+df_bm <- df_bm[order(df_bm$entrezgene_id),]
+df_bm
+
+```
+
+## Get 5`UTRs
+Repeat ALL of 3'UTR but for the 5'UTR lengths, literally copy-pasted code but the 3'UTR data is 5'UTR and name changes.
+
+### connecting 
+
+```{r}
+# Extract the 3`UTR lengths.
+
+rm(threeUTRs, length_threeUTRs, the_lengths, df)
+
+threeUTRs          <- fiveUTRsByTranscript(RefSeq, use.names=TRUE)
+length_threeUTRs   <- width(ranges(threeUTRs))
+the_lengths        <- as.data.frame(length_threeUTRs)
+the_lengths        <- the_lengths %>% group_by(group, group_name) %>% summarise(sum(value))
+the_lengths        <- unique(the_lengths[,c("group_name", "sum(value)")])
+colnames(the_lengths) <- c("RefSeqID", "5' UTR Length")
+
+df <- as.data.frame(the_lengths)
+#rm(threeUTRs, length_threeUTRs, the_lengths)
+# rm(threeUTRs, length_threeUTRs)
+# rm(RefSeq)
+# rm(the_lengths)
+
+```
+
+```{r}
+# Linking RefSeq IDs to Entrez IDs on df. "N_" prefixed IDs are curated, "X_" prefixed IDs are not. <runs slowly>
+# Source: https://www.biostars.org/p/379962/
+# Source: https://web.mit.edu/~r/current/arch/i386_linux26/lib/R/library/org.Hs.eg.db/html/org.Hs.egREFSEQ.html
+
+
+# Add the EntrezID column.
+df <- add_column(df, EntrezID=NA, .after = "RefSeqID")
+df <- add_column(df, RefSeqID_crop=NA, .after = "RefSeqID")
+
+
+# Check if the RefSeq ID from df is curated, then match it in df_bm to get the corresponding EntrezID.
+for (r in 1:nrow(df)) 
+{
+  # Crop
+  df[r, "RefSeqID_crop"] <- trim.numbers(df[r, "RefSeqID"])
+                                  
+  # Connect each RefSeq ID to their corresponding EntrezID.
+  if (substr(df[r, "RefSeqID"], 1, 1) == "N") 
+    df[r, "EntrezID"] <- BM.info$entrezgene_id[match(df[r, "RefSeqID_crop"], BM.info$refseq_mrna)]
+  
+  if (substr(df[r, "RefSeqID"], 1, 1) == "X") 
+    df[r, "EntrezID"] <- BM.info$entrezgene_id[match(df[r, "RefSeqID_crop"], BM.info$refseq_mrna_predicted)]
+}
+
+# Order by ascending EntrezIDs.
+df[order(df$RefSeqID),]
+df <- df[order(df$EntrezID),]
+df
+
+```
+
+```{r}
+# Check for uniqueness among the RefSeqID and EntrezID columns.
+
+print(paste0("Full uniqueness in RefSeqID: ", (nrow(df) == length(unique(unlist(c(df["RefSeqID"])))) ) ))
+print(paste0("Full uniqueness in EntrezID: ", (nrow(df) == length(unique(unlist(c(df["EntrezID"])))) ) ))
+# Then both coming back FALSE reflects a many-to-many mapping between genes and mRNA.
+
+a <- sum(is.na(df["EntrezID"]))
+b <- nrow(df)
+print(paste0("There are ", a, " out of ", b, " missing entries in the EntrezID column (", round((a*100)/b, 1), "%)--"))
+rm(a, b)
+
+```
+
+```{r}
+df_bm
+```
+
+### transfering
+Connecting the entrez-indexed dataframe with the 3`UTR values from the RefSeq-indexed dataframe.
+
+```{r}
+# Move over the 3'UTR lengths for the curated and uncurated mRNA segments. <runs slowly>
+
+# Create curated and uncurated lengths column.
+if (length(which(colnames(df_bm) %in% "5'UTR_max")) == 0)
+{
+  df_bm <- add_column(df_bm, `5'UTR_max`=NA, .after = "entrezgene_id")
+  df_bm <- add_column(df_bm, `5'UTR_N`=NA, .after = "refseq_mrna")
+  df_bm <- add_column(df_bm, `5'UTR_X`=NA, .after = "refseq_mrna_predicted")
+}
+
+# Handling duplicated from the many-to-many mapping.
+dup_row_idx <- list()
+
+# Cycle through df_bm's EntrezIDs and grab the lengths.
+for (row in 1:nrow(df_bm))
+{
+  
+  # In case this df_bm entry lacks a RefSeq ID, copy one over.
+  if ((df_bm$refseq_mrna[row] == "") & (df_bm$refseq_mrna_predicted[row] == ""))
+  {
+    # Get the indicies in df corresponding to the EntrezID from df_bm.
+    rs <- which(df$EntrezID %in% df_bm$entrezgene_id[row])
+
+    if (length(rs) > 0)
+    {
+      # Split the
+      t.rs <- substring(df$RefSeqID_crop[rs], 1, 1)
+      rs.n <- df[rs[t.rs == "N"], c("RefSeqID_crop", "EntrezID")]
+      rs.x <- df[rs[t.rs == "X"], c("RefSeqID_crop", "EntrezID")]
+
+      # Double sure that the RefSeq IDs do correspond to the orignal df_bm EntrezID.
+      rs.n <- rs.n$RefSeqID_crop[rs.n$EntrezID == df_bm$entrezgene_id[row]]
+      rs.x <- rs.x$RefSeqID_crop[rs.x$EntrezID == df_bm$entrezgene_id[row]]
+
+      # Find their corresponding 5`UTR lengths and their the maximum index, then assign.
+      t.rs <- which.max(df$`5' UTR Length`[which(df$RefSeqID_crop %in% rs.n)])
+      if (length(t.rs) > 0) df_bm$refseq_mrna[row] <- rs.n[t.rs]
+      t.rs <- which.max(df$`5' UTR Length`[which(df$RefSeqID_crop %in% rs.x)])
+      if (length(t.rs) > 0) df_bm$refseq_mrna_predicted[row] <- rs.x[t.rs]
+    }
+  }
+  
+  # Grab df rows where the df_bm RefSeq IDs match those in df.
+  n_type <- which(df$RefSeqID_crop %in% df_bm$refseq_mrna[row])
+  x_type <- which(df$RefSeqID_crop %in% df_bm$refseq_mrna_predicted[row])
+  
+  # In cases where there is no matching RefSeq ID, try using the EntrezID
+  if ((length(c(n_type)) == 0) & (length(c(x_type)) == 0))  
+  {
+    # Also grab the df rows based on the df_bm entrez ID, since biomaRt doesn't cover all relevant genes.
+    type.all <- which(df$RefSeqID_crop %in% df[which(df$EntrezID %in% df_bm$entrezgene_id[row]), "RefSeqID_crop"])
+    
+    for (m in type.all)
+    {
+      rs <- df$RefSeqID_crop[m]
+      
+      if (substr(rs, 1, 1) == "N")
+        if (length(which(n_type %in% m)) == 0)
+          n_type <- c(n_type, m)
+      
+      if (substr(rs, 1, 1) == "X")
+        if (length(which(x_type %in% m)) == 0)
+          x_type <- c(x_type, m)
+    }
+    
+    # I just can't handle this man :sob:
+    if ((length(c(n_type))) > 1 & (length(c(x_type)) > 1))  
+      x_type <- integer(0)  
+  }
+  
+  if (length(c(n_type)) > 0)
+  {
+    # Check that the curated 5' UTR lengths are equal for each sublist, handle empty lists.
+    utr_val <- unique(unlist(df$`5' UTR Length`[c(n_type)]))
+    
+    # If there are multiple length values for curated mRNAs, record the index for later handling.
+    if(length(utr_val) > 1) dup_row_idx <- list(unlist(dup_row_idx), row)
+    
+    # If there is only one length value for curated mRNAs, save it in df_bm.
+    if(length(utr_val) == 1) 
+    {
+      df_bm$`5'UTR_N`[row] <- utr_val
+      df_bm$`5'UTR_max`[row] <- utr_val
+      if (df_bm$refseq_mrna[row] == "") 
+        df_bm$refseq_mrna[row] <-df$RefSeqID_crop[c(n_type)[1]]
+    }
+  }
+  
+  if (length(c(x_type)) > 0)
+  {
+    # Check that the curated 5' UTR lengths are equal for each sublist, handle empty lists.
+    utr_val <- unique(unlist(df$`5' UTR Length`[c(x_type)]))
+    
+    # If there are multiple length values for uncurated mRNAs, record the index for later handling.
+    if(length(utr_val) > 1) dup_row_idx <- list(unlist(dup_row_idx), row) 
+    
+    # If there is only one length value for uncurated mRNAs, save it in df_bm.
+    if(length(utr_val) == 1) 
+    {
+      df_bm$`5'UTR_X`[row] <- utr_val
+      if (is.na(df_bm$`5'UTR_max`[row])) df_bm$`5'UTR_max`[row] <- utr_val
+      if (df_bm$refseq_mrna_predicted[row] == "") 
+        df_bm$refseq_mrna_predicted[row] <-df$RefSeqID_crop[c(x_type)[1]]
+    }
+  }
+}
+
+dup_row_idx <- unique(unlist(dup_row_idx))
+
+```
+
+### handling dups
+
+```{r}
+# Handle the duplicate values, by first narrowing down the df indices per df_bm index into a single data structure.
+
+dup_vals <- list()
+
+for (dri in dup_row_idx)
+{
+  # Grab the df indicies from the df_bm label.
+  n_type <- which(df$RefSeqID_crop %in% df_bm$refseq_mrna[dri])
+  x_type <- which(df$RefSeqID_crop %in% df_bm$refseq_mrna_predicted[dri])
+  
+  # In cases where there is no matching RefSeq ID, try using the EntrezID
+  if ((length(c(n_type)) < 2) & (length(c(x_type)) < 2))  
+  {
+    # Also grab the df rows based on the df_bm entrez ID, since biomaRt doesn't cover all relevant genes.
+    type.all <- which(df$RefSeqID_crop %in% df[which(df$EntrezID %in% df_bm$entrezgene_id[dri]), "RefSeqID_crop"])
+    
+    for (m in type.all)
+    {
+      rs <- df$RefSeqID_crop[m]
+      
+      if (substr(rs, 1, 1) == "N")
+        if (length(which(n_type %in% m)) == 0)
+          n_type <- c(n_type, m)
+      
+      if (substr(rs, 1, 1) == "X")
+        if (length(which(x_type %in% m)) == 0)
+          x_type <- c(x_type, m)
+    }
+    
+    # I just can't handle this man :sob:
+    if ((length(c(n_type))) > 1 & (length(c(x_type)) > 1))  
+      x_type <- integer(0)  
+  }
+  
+  
+  # Check for double duplicates across the mRNA types.
+  if ((length(c(n_type))) > 1 & (length(c(x_type)) > 1)) stop(paste0("We got a problem here (", dri,"), cheif..."))
+  
+  # Grab the plural index (not checking if it exists because we can assume so).
+  if (length(c(n_type)) > 1) dup_vals[[dri]] <- n_type
+  if (length(c(x_type)) > 1) dup_vals[[dri]] <- x_type
+  
+  if (((length(c(n_type))) > 1 | (length(c(x_type)) > 1)) & (length(dup_vals[[dri]]) == 0)) 
+  {
+    if ((length(c(n_type))) > 1 | (length(c(x_type)) > 1)) print(dri)
+    if (length(c(n_type)) > 1) print(n_type)
+    if (length(c(x_type)) > 1) print(x_type)
+    
+    stop(paste0("We got a failed save here (", dri,"), cheif..."))
+  }
+}
+
+dup_vals <- dup_vals[c(unlist(dup_row_idx))]
+names(dup_vals) <- c(unlist(dup_row_idx))
+
+```
+
+```{r}
+# Create a duplicate row with a suffix added for the duplicated RefSeq IDs.
+# Note, R is pass-by-value ONLY.
+
+# for each duplicate
+for (d_val in names(dup_vals))
+{
+  d_idx <- as.double(d_val) # df_bm index
+  d_val <- which(names(dup_vals) %in% d_idx) # which entry in the duplicate rows list
+  d_len <- length(unlist(dup_vals[d_val])) # number of duplicate rows
+  d_val <- c(unlist(dup_vals[d_val][1])) # unlist and save for looping
+  
+  # Toggle whether this set of rows is curated duplicates or uncurated duplicates (iirc it is either-or).
+  if (!is.na(df[c(unlist(d_val[1])),]$RefSeqID[1]) & 
+      substring(df[c(unlist(d_val[1])),]$RefSeqID[1],1,2) == "NM") 
+    curated=T 
+  else curated=F
+  
+  # Duplicate the singular row in df_bm for modification.
+  row_base <- df_bm[d_idx,]
+  
+  # For each entry, working backwards...
+  for (i in 1:d_len)
+  {
+    # ...set up the df_bm row to be modified...
+    row_temp <- row_base
+    
+    # ...save the specific duplicated df row for their 5`UTR value, then with respect to curated and uncurated entries...
+    df_row <- df[d_val, "5' UTR Length"]
+    
+    # ...update it to have the UTR length, and modify the df_bm row's corresponding RefSeq name for each duplicate...
+    # ...plus updating the max column value...
+    if (curated == TRUE)
+    {
+      row_temp$"5'UTR_N" <- df_row[i]
+      row_temp$"5'UTR_max" <- row_temp$"5'UTR_N"
+      
+     } else {
+       
+      row_temp$"5'UTR_X" <- df_row[i]
+      if (is.na(row_temp$"5'UTR_max")) row_temp$"5'UTR_max" <- row_temp$"5'UTR_X"
+    }
+    
+    # ...before finally adding it back into df_bm! (at the end)
+    df_bm <- add_row(df_bm, row_temp)
+    rownames(df_bm)[nrow(df_bm)] <- paste0( row.names(row_base), ".", letters[i])
+  }
+}
+
+# Lastly, remove the initial (unmodified) row that is without any values, then re-order.
+df_bm <- df_bm[-as.double(names(dup_vals)), ]
+df_bm <- df_bm[order(df_bm$entrezgene_id),]
+df_bm
+
+```
+
+### clean up
+
+```{r}
+
+rm (df, BM.info, dup_vals, length_threeUTRs, missing, 
+    mmu.genes, mmu.genesets, mmu.kegg, mmu.mousecyc, mmu.msigdb,
+    row_base, row_temp, the_lengths, threeUTRs, gene_symbols)
+
+gc()
+
+```
+
+## Get AREs
+What is the difference in ARE between apoptosis and CICD?
+We use the ARED Plus database for human AREs and make modifications and necessary.
+
+### importing
+
+```{r}
+# Import the ARED Plus databases.
+
+if (!exists("df_bm")) df_bm <- import.df_bm()
+
+df.are.utr <- as.data.frame(read.csv("data/ARED.full.3utr.csv"))
+df.are.utr
+
+df.are.itr <- as.data.frame(read.csv("data/ARED.full.intron.csv"))
+df.are.itr
+
+```
+
+```{r}
+# Create the HGNC to MGI symbol data frame for both the 3`UTR AREs and intronic AREs.
+
+t.map <- gene.names.human2mouse(c(unique(df.are.utr$GeneName), unique(df.are.itr$Gene.Symbol)))
+
+t.map$no.df.idx <- NA
+t.map$in.utr <- FALSE
+t.map$in.itr <- FALSE
+t.map$both   <- FALSE
+
+
+for (i in c(1:nrow(t.map)))
+{
+  t.map$no.df.idx[i] <- length(which(df_bm$gene_symbols %in% t.map$MGI.symbol[i]))
+  
+  j <- which(df.are.utr$GeneName %in% t.map$HGNC.symbol[i])
+  if (length(j) > 0) t.map$in.utr[i] <- TRUE
+  
+  k <- which(df.are.itr$Gene.Symbol %in% t.map$HGNC.symbol[i])
+  if (length(k) > 0) t.map$in.itr[i] <- TRUE
+  
+  if (t.map$in.utr[i] & t.map$in.itr[i]) t.map$both[i] <- TRUE
+}
+
+# t.map
+
+```
+
+```{r}
+# Link the HGNC symbols directly into df_bm.
+
+if (length(which(colnames(df_bm) %in% "HGNC.symbol")) == 0) 
+  df_bm <- add_column(df_bm, HGNC.symbol=NA, .after="gene_symbols")
+
+df_bm$t.map.idx   <- -1
+df_bm$HGNC.symbol <- NA
+
+
+for (i in 1:nrow(df_bm))
+{
+  j <- which(t.map$MGI.symbol %in% df_bm$gene_symbols[i])
+  
+  if (length(j) == 1) df_bm$t.map.idx[i] <- j
+  if (length(j)  > 1) df_bm$t.map.idx[i] <- 0
+  
+  
+  # Handling the one-to-one mapping case.
+  if (length(j) == 1) df_bm$HGNC.symbol[i] <- t.map[j, "HGNC.symbol"]
+  
+  # The duplicate case requires duplicating the df_bm rows again.
+  if (length(j)  > 1)
+  {
+    # Duplicate the singular row in df_bm for modification.
+    row_base <- df_bm[i,]
+    h <- 1
+    
+    # For each entry, working backwards...
+    for (k in j)
+    {
+      # ...set up the df_bm row to be modified...
+      row_temp <- row_base
+      
+      # ...then update it to have the t.map index and human symbol...
+      row_temp$t.map.idx   <- k
+      row_temp$HGNC.symbol <- t.map[k, "HGNC.symbol"]
+      
+      # ...before finally adding it back into df_bm! (at the end)
+      df_bm <- add_row(df_bm, row_temp)
+      rownames(df_bm)[nrow(df_bm)] <- paste0(row.names(row_base), ".", LETTERS[h])
+      h <- h + 1
+    }
+  }
+}
+
+# Lastly, remove the initial (unmodified) row that is without any values.
+df_bm <- df_bm[-c(which(df_bm$t.map.idx %in% 0)),]
+ 
+# Re-order so the duplicate rows are together. 
+df_bm <- df_bm[order(df_bm$entrezgene_id),]
+# df_bm
+
+```
+
+```{r}
+df_bm
+```
+
+```{r}
+# Check the mapping between the two data frames (3`UTR).
+
+print(paste0("ARED: ", length(which(df.are.utr$GeneName %in% df_bm$HGNC.symbol)), "/", nrow(df.are.utr)))
+print(paste0("dfBM: ", length(which(df_bm$HGNC.symbol %in% df.are.utr$GeneName)), "/", nrow(df_bm)))
+
+```
+
+```{r}
+# Check the mapping between the two data frames (Introns).
+
+print(paste0("ARED: ", length(which(df.are.itr$Gene.Symbol %in% df_bm$HGNC.symbol)), "/", nrow(df.are.itr)))
+print(paste0("dfBM: ", length(which(df_bm$HGNC.symbol %in% df.are.itr$Gene.Symbol)), "/", nrow(df_bm)))
+
+```
+
+```{r}
+df_bm.safe <- df_bm
+# write.csv(df_bm, "P3_outputs/conversion_table_postARED.csv", row.names=TRUE)
+```
+
+
+```{r}
+# Since df_bm has duplicates, match its entries to the row names in the ARED df.
+df_bm <- df_bm.safe
+
+l.col <- which(colnames(df_bm) %in% "unmatched")
+if (length(which(colnames(df_bm) %in% "ared")) == 0)
+{
+  df_bm <- add_column(df_bm, ared= FALSE,      .before=l.col+1)
+  df_bm <- add_column(df_bm, ared.utr=NA,      .before=l.col+2)
+  df_bm <- add_column(df_bm, ared.itr=NA,      .before=l.col+3)
+  df_bm <- add_column(df_bm, gc.proportion=NA, .before=l.col+4)
+  df_bm <- add_column(df_bm, seq.length=NA,    .before=l.col+5)
+  df_bm <- add_column(df_bm, drop=FALSE,       .before=l.col+6)
+  df_bm <- add_column(df_bm, multi.are=FALSE,  .before=l.col+6)
+}
+
+use.utr <- TRUE
+use.itr <- FALSE
+
+if (!use.utr | !use.itr)
+  df_bm$multi.are <- NA
+
+for (i in c(1:nrow(df_bm)))
+{
+  
+  # For examining UTR AREs.
+  if (use.utr)
+  {
+    # Find and toggle.
+    j <- which(df.are.utr$GeneName    %in% df_bm[i,]$HGNC.symbol)
+    if (length(j) > 0) df_bm[i,]$ared <- TRUE
+    
+    # Assign ARE values, duplicate rows as needed.
+    if (length(j) == 1) df_bm[i, ] <- are.value.update(df_bm[i,], j, TRUE)
+    if (length(j) > 1)  df_bm      <- are.multi.loop(df_bm, i, j, TRUE)
+  }
+  
+  # For examining Intronic AREs.
+  if (use.itr)
+  {
+    # Find and toggle.
+    k <- which(df.are.itr$Gene.Symbol %in% df_bm[i,]$HGNC.symbol)
+    if (length(k) > 0) df_bm[i,]$ared <- TRUE
+    
+    # Assign ARE values, duplicate rows as needed.
+    if (length(k) == 1) df_bm[i, ] <- are.value.update(df_bm[i,], k, FALSE)
+    if (length(k) > 1)  df_bm      <- are.multi.loop(df_bm, i, k, FALSE)
+  }
+  
+  # Metadata.
+  if (use.utr & use.itr)
+    if ((length(j)>0) & (length(k)>0)) df_bm$multi.are[i] <- TRUE
+}
+
+
+# # Lastly, remove the initial (unmodified) row that is without any values.
+df_bm <- df_bm[!df_bm$drop,]
+df_bm <- df_bm[, -c(which(colnames(df_bm) %in% "drop"))]
+
+# Re-order so the duplicate rows are together.
+df_bm <- df_bm[order(df_bm$entrezgene_id),]
+df_bm
+
+```
+
+```{r}
+table(df_bm$gc.proportion)
+print("")
+table(df_bm$seq.length)
+print("")
+print(sum(is.na(df_bm$gc.proportion)))
+#df_bm[20000:20647, ]
+#df_bm[11000:11080, ]
+#df_bm
+```
+
+```{r}
+# Check the mapping between the two data frames (INTRON).
+
+print(paste0("dfBM: ", sum(df_bm$ared), "/", dim(df_bm)[1]))
+print(paste0("dfBM: ", sum(!is.na(df_bm$ared.utr)), "/", dim(df_bm)[1]))
+print(paste0("dfBM: ", sum(!is.na(df_bm$ared.itr)), "/", dim(df_bm)[1]))
+print(paste0("dfBM: ", sum(!is.na(df_bm$filled)), "/", dim(df_bm)[1]))
+
+```
+
+```{r}
+# write.csv(df_bm, "P3_outputs/conversion_table_postAREDtwo.csv", row.names=TRUE)
+```
+
+### experimenting
+
+```{r}
+stop("Pause, pause, paaaaaaaaause~!--")
+```
+
+
+```{r}
+df_bm
+```
+
+
+```{r}
+# Create a dataframe containing all the comparative data between the two treatments.
+
+# Define key variables.
+c.ind <- c("a.u", "c.u", "a.d", "c.d", "a.m", "c.m")
+c.row <- c("are.genes", "total.genes", "are.percent", "are.mean")
+df.exp <- data.frame(exp=c.ind)
+rownames(df.exp) <- df.exp$exp
+df.exp <- df.exp[, -c(1)]
+
+# Grab the needed index for later calculations.
+col.i <- which(colnames(df_bm) %in% "upreg.a") - 1
+
+# Absolute values
+for (i in c(1:length(c.ind)))
+{
+  # XXX Remove other-feature duplicates.
+  
+  
+  
+  # General statistics for ARE presence.
+  df.exp[i, "are.genes"]   <- sum(as.integer((df_bm[, c.ind[i]])&(df_bm$ared)) > 0)
+  df.exp[i, "total.genes"] <- sum(as.integer( df_bm[, c.ind[i]]) > 0)
+  df.exp[i, "are.pecent"]  <- df.exp[i, "are.genes"] * 100 / df.exp[i, "total.genes"]
+  # df.exp[i, "are.mean"] <- mean(as.integer( df_bm[df_bm[, c.ind[i]], "ared"]>0 )) # same as the percentage
+  
+  
+  
+  # Is there a significant difference in the DEGs' and non-DEGs' ARE presence? (a.u)
+  df.exp[i, "t.test.p.DEG.i"] <- round(t.test(as.integer( df_bm[df_bm$ared, c.ind[i]]), 
+                                            as.integer(!df_bm[df_bm$ared, c.ind[i]]))$p.value, 6)
+  
+  # Is there a significant difference in the DEGs' ARE presence wrt process? (a.u vs c.u)
+  if (i %% 2 == 0)
+      df.exp[c((i-1):i), "t.test.p.DEG.e"] <- round(t.test(as.integer(df_bm[df_bm$ared, c.ind[i]  ]),
+                                                         as.integer(df_bm[df_bm$ared, c.ind[i-1]]))$p.value, 6)
+  else df.exp[i, "t.test.p.DEG.e"] <- NA
+  
+  # Is there a significant difference in the up-regulated and static genes' ARE presence? (upreg.a)
+  df.exp[i, "t.test.p.EA.i"] <- round(t.test(as.integer( df_bm[df_bm$ared, (col.i+i)]), 
+                                           as.integer(!df_bm[df_bm$ared, (col.i+i)]))$p.value, 6)
+  
+  # Is there a significant difference in the up-regulated genes' ARE presence wrt process? (upreg.a vs upreg.c)
+  if (i %% 2 == 0) 
+      df.exp[c((i-1):i), "t.test.p.EA.e"] <- round(t.test(as.integer(df_bm[df_bm$ared, (col.i+i)  ]),
+                                                        as.integer(df_bm[df_bm$ared, (col.i+i-1)]))$p.value, 6)
+  else df.exp[i, "t.test.p.EA.e"] <- NA
+  
+  
+  
+  # UTR statistics.
+  df.exp[i, "utr.length.avg"]  <- mean(df_bm[(df_bm$c.ind[i])&!is.na(df_bm["ared.utr"]), "seq.length"], na.rm=T)
+  df.exp[i, "utr.gc.prop.avg"] <- mean(df_bm[(df_bm$c.ind[i])&!is.na(df_bm["ared.utr"]), "gc.proportion"], na.rm=T) 
+  df.exp[i, "utr.are.prop"]    <- !is.na(df_bm["ared.utr"]) / df.exp[i, "total.genes"]
+  
+  
+  
+  # Sequence length analysis (DEG).
+  df.exp[i, "t.test.u.l.DEG.i"] <- round(t.test(
+    df_bm[(df_bm$ared)&(df_bm$ared.utr)& (df_bm[, c.ind[i]]), "seq.length"],
+    df_bm[(df_bm$ared)&(df_bm$ared.utr)&!(df_bm[, c.ind[i]]), "seq.length"])$p.value, 6)
+  
+  if (i %% 2 == 0)
+      df.exp[c((i-1):i), "t.test.u.l.DEG.e"] <- round(t.test(
+        df_bm[(df_bm$ared)&(df_bm$ared.utr)& (df_bm[, c.ind[i  ]]), "seq.length"],
+        df_bm[(df_bm$ared)&(df_bm$ared.utr)& (df_bm[, c.ind[i-1]]), "seq.length"])$p.value, 6)
+  else df.exp[i, "t.test.u.l.DEG.e"] <- NA
+  
+  # Sequence length analysis (EA).
+  df.exp[i, "t.test.u.l.EA.i"] <- round(t.test(
+    df_bm[(df_bm$ared)&(df_bm$ared.utr)& (df_bm[, (col.i+i)]), "seq.length"],
+    df_bm[(df_bm$ared)&(df_bm$ared.utr)&!(df_bm[, (col.i+i)]), "seq.length"])$p.value, 6)
+  
+  if (i %% 2 == 0)
+      df.exp[c((i-1):i), "t.test.u.l.EA.e"] <- round(t.test(
+        df_bm[(df_bm$ared)&(df_bm$ared.utr)& (df_bm[, (col.i+i)  ]), "seq.length"],
+        df_bm[(df_bm$ared)&(df_bm$ared.utr)& (df_bm[, (col.i+i-1)]), "seq.length"])$p.value, 6)
+  else df.exp[i, "t.test.u.l.EA.e"] <- NA
+  
+
+  
+  # GC analysis (DEG).
+  df.exp[i, "t.test.u.gc.DEG.i"] <- round(t.test(
+    df_bm[(df_bm$ared)&(df_bm$ared.utr)& (df_bm[, c.ind[i]]), "gc.proportion"],
+    df_bm[(df_bm$ared)&(df_bm$ared.utr)&!(df_bm[, c.ind[i]]), "gc.proportion"])$p.value, 6)
+  
+  if (i %% 2 == 0)
+      df.exp[c((i-1):i), "t.test.u.gc.DEG.e"] <- round(t.test(
+        df_bm[(df_bm$ared)&(df_bm$ared.utr)& (df_bm[, c.ind[i  ]]), "gc.proportion"],
+        df_bm[(df_bm$ared)&(df_bm$ared.utr)& (df_bm[, c.ind[i-1]]), "gc.proportion"])$p.value, 6)
+  else df.exp[i, "t.test.u.gc.DEG.e"] <- NA
+  
+  # GC analysis (EA).
+  df.exp[i, "t.test.u.gc.EA.i"] <- round(t.test(
+    df_bm[(df_bm$ared)&(df_bm$ared.utr)& (df_bm[, (col.i+i)]), "gc.proportion"],
+    df_bm[(df_bm$ared)&(df_bm$ared.utr)&!(df_bm[, (col.i+i)]), "gc.proportion"])$p.value, 6)
+  
+  if (i %% 2 == 0)
+      df.exp[c((i-1):i), "t.test.u.gc.EA.e"] <- round(t.test(
+        df_bm[(df_bm$ared)&(df_bm$ared.utr)& (df_bm[, (col.i+i  )]), "gc.proportion"],
+        df_bm[(df_bm$ared)&(df_bm$ared.utr)& (df_bm[, (col.i+i-1)]), "gc.proportion"])$p.value, 6)
+  else df.exp[i, "t.test.u.gc.EA.e"] <- NA
+  
+  
+  
+  
+  
+  # ITR statistics.
+  # XXX
+  
+}
+
+df.exp.ared <- df.exp
+df.exp.ared
+
+rm(df.exp)
+
+```
+
+
+
+
+
+```{r}
+# Export the ARED ARE analysis results.
+
+if (FALSE)
+{
+  r <- which(colnames(df.exp.ared) %in% "m.list")
+  
+  time_date <- paste0(Sys.Date(), "--", format(Sys.time(), "%H-%M-%S--"))
+  write.csv(df.exp.ared[, -c(r)], "P3_outputs/ARED_analysis.csv", row.names=TRUE)
+  write.csv(df.exp.ared[, -c(r)], paste0("P3_outputs/archives/", time_date, "ARED_analysis.csv"), row.names = FALSE)
+}
+
+```
+
+
+```{r}
+stop("Finished running computational body df_bm.--")
+```
+
+
+```{r}
+sum( df_bm[df_bm$ared, (col.i+i)]) # up.reg from EA
+sum(!df_bm[df_bm$ared, (col.i+i)])
+sum( df_bm[df_bm$ared, c.ind[i]]) # significant from DEG
+sum(!df_bm[df_bm$ared, c.ind[i]])
+```
+```{r}
+sum(as.integer( df_bm[ df_bm[, (col.i+i)], "ared"]>0 ))
+sum(as.integer( df_bm[!df_bm[, (col.i+i)], "ared"]>0 ))
+```
+
+
+```{r}
+as.integer(!df_bm[df_bm$ared, (col.i+i)])
+as.integer( df_bm[!df_bm[, (col.i+i)], "ared"]>0 )
+```
+
+
+
+### clean up
+
+```{r}
+
+rm (df_bm.safe, df.are.utr, df.are.itr)
+
+gc()
+
+```
+
+
+
+## Get cDNA GC levels
+
+### importing
+
+```{r, include=FALSE}
+# Connecting the df_bm values to df.cdna for one cohesive data frame.
+
+# Convenience check.
+if (!exists("df_bm")) df_bm <- import.df_bm()
+df_bm$cdna.idx <- NA
+
+df.cdna <- data.frame(entrezgene_id=unique(df_bm$entrezgene_id), sequence=NA, length=NA, gc.prop=NA,
+                      number.of.sequences=NA, drop=FALSE,
+                      average.GC=NA, median.GC=NA, highest.GC=NA, lowest.GC=NA,
+                      average.length=NA, median.length=NA, longest.sequence=NA, shortest.sequence=NA)
+
+# Find the matching indecies.
+for (i in 1:nrow(df_bm))
+{
+  j <-   which(df.cdna$entrezgene_id %in% df_bm$entrezgene_id[i])
+  dup <- df_bm$entrezgene_id[i] == df_bm$entrezgene_id[i-1] 
+  
+  if (length(j) > 0)
+    if (length(dup) > 0)
+      if (!dup)
+        df_bm$cdna.idx[i] <- j
+  
+  if ((length(dup) == 0) & (i == 1))
+    df_bm$cdna.idx[i] <- j
+  
+  if (length(j) > 2)
+    stop(paste0("issue at ", i, "--"))
+}
+
+# Copy over columns.
+idx.f <- which(colnames(df_bm) %in% "a.u")
+idx.l <- which(colnames(df_bm) %in% "static.c")
+df.cdna <- cbind(df.cdna, df_bm[!is.na(df_bm$cdna.idx), c(3, idx.f:idx.l)])
+
+if (sum(df.cdna[, which(colnames(df.cdna) %in% "entrezgene_id")[1]] == 
+        df.cdna[, which(colnames(df.cdna) %in% "entrezgene_id")[2]]) != nrow(df.cdna))
+  stop("The copying over went incorrectly!!")
+
+df.cdna <- df.cdna[, -c(which(colnames(df.cdna) %in% "entrezgene_id")[2])]
+  
+```
+
+
+```{r, include=FALSE}
+# Importing then analysising the cDNA databases in small steps of n (500).
+
+i <- 0
+n <- 500
+reached.end <- FALSE
+i.max   <- length(unique(df_bm$entrezgene_id))
+
+#feature <- "cdna"
+feature <- "3utr"
+#feature <- "5utr"
+
+# Remove the variable to make sure there's no information contamination.
+if (exists("t.cdna")) rm(t.cdna)
+
+while (!reached.end)
+{
+  # Handle indicie magic.
+  i <- i + 1
+  print(paste0("Importing ", i, "/", ceiling(i.max/n), " queries.--"))
+
+  # Import the database.
+  t.cdna <- as.data.frame(read_csv(paste0("P3_outputs/the_cdna_archives/", feature, "_portion_", i, ".csv")))
+  if (!file.exists(paste0("P3_outputs/the_cdna_archives/", feature, "_portion_", i+1, ".csv")))
+    reached.end <- TRUE
+
+  for (k in which(df.cdna$entrezgene_id %in% t.cdna$entrezgene_id))
+  {
+
+    seq <- t.cdna[which(t.cdna$entrezgene_id %in% df.cdna$entrezgene_id[k]), feature]
+    df.cdna$number.of.sequences[k] <- length(seq)
+    # Catch empty seq sequences.
+    if (length(seq)==1) if (is.na(seq)) df.cdna$number.of.sequences[k] <- 0
+
+    # Create a spread of the data.
+    if (df.cdna$number.of.sequences[k] > 0)
+    {
+      t.seq <- sapply(seq, str_length)
+      df.cdna$average.length[k]    <- mean(t.seq)
+      df.cdna$median.length[k]     <- median(t.seq)
+      df.cdna$longest.sequence[k]  <- max(t.seq)
+      df.cdna$shortest.sequence[k] <- min(t.seq)
+
+      seq.gc <- sapply(seq, base_proportions)
+      df.cdna$average.GC[k] <- mean(seq.gc)
+      df.cdna$median.GC[k]  <- median(seq.gc)
+      df.cdna$highest.GC[k] <- max(seq.gc)
+      df.cdna$lowest.GC[k]  <- min(seq.gc)
+    }
+
+    # Create duplicate rows to capture individual isoforms.
+    row_base <- df.cdna[k, ]
+
+    # For each entry, working backwards...
+    for (s in seq)
+    {
+      if(!is.na(s))
+      {
+        # ...set up the df row to be modified... ...then add in the new values...
+        row_temp <- row_base
+        row_temp$sequence <- s
+        row_temp$length   <- str_length(s)
+        row_temp$gc.prop  <- base_proportions(s)
+        
+        # ...before finally adding it back into df! (at the end)
+        if (df.cdna$number.of.sequences[k] == 1)
+          df.cdna[k, ] <- row_temp
+        else
+          df.cdna <- add_row(df.cdna, row_temp)
+      }
+    }
+
+    # Modify the original base row to be dropped for later.
+    if (df.cdna$number.of.sequences[k] > 1)
+     df.cdna[k, "drop"] <- TRUE
+  }
+
+  # Remove the variable to make sure there's no information contamination.
+  rm(t.cdna)
+}
+
+
+# Lastly, remove the initial (unmodified) row that is without any values.
+df.cdna <- df.cdna[!df.cdna$drop,]
+df.cdna <- df.cdna[, -c(which(colnames(df.cdna) %in% "drop"))]
+df.cdna <- df.cdna[order(df.cdna$entrezgene_id),]
+
+```
+
+```{r}
+
+print(paste0("The number of unique EntrezIDs is ", length(unique(df.cdna$entrezgene_id))))
+print(paste0(sum(length(unique(df.cdna$entrezgene_id[!is.na(df.cdna$sequence)])))
+             , "/", length(unique(df.cdna$entrezgene_id))))
+print(paste0(sum(!is.na(df.cdna$sequence)), "/", nrow(df.cdna)))
+
+```
+
+```{r}
+# Export analysis.
+
+if (FALSE)
+{
+  time_date <- paste0(Sys.Date(), "--", format(Sys.time(), "%H-%M-%S--"))
+  write.csv(df.cdna, paste0("P3_outputs/", feature, "_cDNA_analysis.csv"), row.names=FALSE)
+  write.csv(df.cdna, paste0("P3_outputs/archives/", time_date, feature, "_cDNA_analysis.csv"), row.names = FALSE)
+}
+
+
+```
+
+### experimenting
+
+```{r}
+# Import UTR sequences.
+
+if (TRUE)
+{
+  if (exists("df.cdna")) rm(df.cdna)
+  
+  df.drie <- as.data.frame(read_csv("P3_outputs/3utr_cDNA_analysis.csv"))
+  df.vijf <- as.data.frame(read_csv("P3_outputs/5utr_cDNA_analysis.csv"))
+}
+
+df.drie
+df.vijf
+
+```
+
+```{r}
+# Create a dataframe containing all the comparative data between the two treatments.
+
+# Define key variables.
+c.ind <- c("a.u", "c.u", "a.d", "c.d", "a.m", "c.m")
+c.row <- c("utr.genes", "total.genes", "utr.percent", "utr.mean")
+df.exp <- data.frame(exp=c.ind)
+rownames(df.exp) <- df.exp$exp
+df.exp <- df.exp[, -c(1)]
+
+# Grab the needed index for later calculations.
+col.i <- which(colnames(df_bm) %in% "upreg.a") - 1
+
+# Absolute values
+for (i in c(1:length(c.ind)))
+{
+  # XXX Remove other-feature duplicates.
+  
+  
+  
+  # General statistics for ARE presence.
+  df.exp[i, "utr.genes"]   <- sum(as.integer((df_bm[, c.ind[i]])&(df_bm$ared)) > 0)
+  df.exp[i, "total.genes"] <- sum(as.integer( df_bm[, c.ind[i]]) > 0)
+  df.exp[i, "are.pecent"]  <- df.exp[i, "are.genes"] * 100 / df.exp[i, "total.genes"]
+  # df.exp[i, "are.mean"] <- mean(as.integer( df_bm[df_bm[, c.ind[i]], "ared"]>0 )) # same as the percentage
+  
+  
+  
+  # Is there a significant difference in the DEGs' and non-DEGs' ARE presence? (a.u)
+  df.exp[i, "t.test.p.DEG.i"] <- round(t.test(as.integer( df_bm[df_bm$ared, c.ind[i]]), 
+                                            as.integer(!df_bm[df_bm$ared, c.ind[i]]))$p.value, 6)
+  
+  # Is there a significant difference in the DEGs' ARE presence wrt process? (a.u vs c.u)
+  if (i %% 2 == 0)
+      df.exp[c((i-1):i), "t.test.p.DEG.e"] <- round(t.test(as.integer(df_bm[df_bm$ared, c.ind[i]  ]),
+                                                         as.integer(df_bm[df_bm$ared, c.ind[i-1]]))$p.value, 6)
+  else df.exp[i, "t.test.p.DEG.e"] <- NA
+  
+  # Is there a significant difference in the up-regulated and static genes' ARE presence? (upreg.a)
+  df.exp[i, "t.test.p.EA.i"] <- round(t.test(as.integer( df_bm[df_bm$ared, (col.i+i)]), 
+                                           as.integer(!df_bm[df_bm$ared, (col.i+i)]))$p.value, 6)
+  
+  # Is there a significant difference in the up-regulated genes' ARE presence wrt process? (upreg.a vs upreg.c)
+  if (i %% 2 == 0) 
+      df.exp[c((i-1):i), "t.test.p.EA.e"] <- round(t.test(as.integer(df_bm[df_bm$ared, (col.i+i)  ]),
+                                                        as.integer(df_bm[df_bm$ared, (col.i+i-1)]))$p.value, 6)
+  else df.exp[i, "t.test.p.EA.e"] <- NA
+  
+  
+  
+  # UTR statistics.
+  df.exp[i, "utr.length.avg"]  <- mean(df_bm[(df_bm$c.ind[i])&!is.na(df_bm["ared.utr"]), "seq.length"], na.rm=T)
+  df.exp[i, "utr.gc.prop.avg"] <- mean(df_bm[(df_bm$c.ind[i])&!is.na(df_bm["ared.utr"]), "gc.proportion"], na.rm=T) 
+  df.exp[i, "utr.are.prop"]    <- !is.na(df_bm["ared.utr"]) / df.exp[i, "total.genes"]
+  
+  
+  
+  # Sequence length analysis (DEG).
+  df.exp[i, "t.test.u.l.DEG.i"] <- round(t.test(
+    df_bm[(df_bm$ared)&(df_bm$ared.utr)& (df_bm[, c.ind[i]]), "seq.length"],
+    df_bm[(df_bm$ared)&(df_bm$ared.utr)&!(df_bm[, c.ind[i]]), "seq.length"])$p.value, 6)
+  
+  if (i %% 2 == 0)
+      df.exp[c((i-1):i), "t.test.u.l.DEG.e"] <- round(t.test(
+        df_bm[(df_bm$ared)&(df_bm$ared.utr)& (df_bm[, c.ind[i  ]]), "seq.length"],
+        df_bm[(df_bm$ared)&(df_bm$ared.utr)& (df_bm[, c.ind[i-1]]), "seq.length"])$p.value, 6)
+  else df.exp[i, "t.test.u.l.DEG.e"] <- NA
+  
+  # Sequence length analysis (EA).
+  df.exp[i, "t.test.u.l.EA.i"] <- round(t.test(
+    df_bm[(df_bm$ared)&(df_bm$ared.utr)& (df_bm[, (col.i+i)]), "seq.length"],
+    df_bm[(df_bm$ared)&(df_bm$ared.utr)&!(df_bm[, (col.i+i)]), "seq.length"])$p.value, 6)
+  
+  if (i %% 2 == 0)
+      df.exp[c((i-1):i), "t.test.u.l.EA.e"] <- round(t.test(
+        df_bm[(df_bm$ared)&(df_bm$ared.utr)& (df_bm[, (col.i+i)  ]), "seq.length"],
+        df_bm[(df_bm$ared)&(df_bm$ared.utr)& (df_bm[, (col.i+i-1)]), "seq.length"])$p.value, 6)
+  else df.exp[i, "t.test.u.l.EA.e"] <- NA
+  
+
+  
+  # GC analysis (DEG).
+  df.exp[i, "t.test.u.gc.DEG.i"] <- round(t.test(
+    df_bm[(df_bm$ared)&(df_bm$ared.utr)& (df_bm[, c.ind[i]]), "gc.proportion"],
+    df_bm[(df_bm$ared)&(df_bm$ared.utr)&!(df_bm[, c.ind[i]]), "gc.proportion"])$p.value, 6)
+  
+  if (i %% 2 == 0)
+      df.exp[c((i-1):i), "t.test.u.gc.DEG.e"] <- round(t.test(
+        df_bm[(df_bm$ared)&(df_bm$ared.utr)& (df_bm[, c.ind[i  ]]), "gc.proportion"],
+        df_bm[(df_bm$ared)&(df_bm$ared.utr)& (df_bm[, c.ind[i-1]]), "gc.proportion"])$p.value, 6)
+  else df.exp[i, "t.test.u.gc.DEG.e"] <- NA
+  
+  # GC analysis (EA).
+  df.exp[i, "t.test.u.gc.EA.i"] <- round(t.test(
+    df_bm[(df_bm$ared)&(df_bm$ared.utr)& (df_bm[, (col.i+i)]), "gc.proportion"],
+    df_bm[(df_bm$ared)&(df_bm$ared.utr)&!(df_bm[, (col.i+i)]), "gc.proportion"])$p.value, 6)
+  
+  if (i %% 2 == 0)
+      df.exp[c((i-1):i), "t.test.u.gc.EA.e"] <- round(t.test(
+        df_bm[(df_bm$ared)&(df_bm$ared.utr)& (df_bm[, (col.i+i  )]), "gc.proportion"],
+        df_bm[(df_bm$ared)&(df_bm$ared.utr)& (df_bm[, (col.i+i-1)]), "gc.proportion"])$p.value, 6)
+  else df.exp[i, "t.test.u.gc.EA.e"] <- NA
+  
+  
+  
+  
+  
+  # ITR statistics.
+  # XXX
+  
+}
+
+df.exp.ared <- df.exp
+df.exp.ared
+
+rm(df.exp)
+
+```
+
+
+## Missing Values Recap
+
+```{r}
+# Sanity checks.
+
+# a <- sum(is.na(df["EntrezID"]))
+# b <- nrow(df)
+# print(paste0("There are ", a, " out of ", b, " missing entries in the EntrezID column (", round((a*100)/b, 1), "%)--"))
+
+print(paste0("The amount of unmatched gene symbols is ", sum(is.na(df_bm$`gene_symbols`)), " (", round(sum(is.na(df_bm$`gene_symbols`))*100/nrow(df_bm),1), "%)--"))
+
+# print(paste0("The amount of unmatched UTR lengths is ", sum(is.na(df_bm.sig.gs$`3'UTR_max`)), " (", round(sum(is.na(df_bm.sig.gs$`3'UTR_max`))*100/nrow(df_bm.sig.gs),1), "%)--"))
+# 
+# print(paste0("The amount of unmatched UTR lengths is ", sum(is.na(df_bm.sig.gs$`3'UTR_max`)), " (", round(sum(is.na(df_bm.sig.gs$`3'UTR_max`))*100/nrow(df_bm.sig.gs),1), "%)--"))
+
+print(paste0("The amount of unmatched human-mouse gene symbol is ", sum(df_bm$`human.idx` == 0), " (", round(sum(df_bm$`human.idx` == 0)*100/nrow(df_bm),1), "%)--"))
+
+print(paste0("The amount of mutli-matched human-mouse gene symbol is ", sum(df_bm$`human.idx` == -1), " (", round(sum(df_bm$`human.idx` == -1)*100/nrow(df_bm),1), "%)--"))
+
+
+```
+
+
+```{r}
+# HGNC to MGI conversion match stats.
+
+print(paste0("The amount of mapped df symbols is ",   sum(t.map$no.df.idx> 0), "/", nrow(t.map), "--"))
+print(paste0("The amount of multi-mapped df symbols is ", sum(t.map$no.df.idx>1), "/", nrow(t.map), "--"))
+
+print(paste0("The amount of UTR symbol matches is ", sum(t.map$in.utr), " (", round(sum(t.map$in.utr)*100/nrow(t.map),1), "%)--"))
+print(paste0("The amount of UTR-df matches is ", sum(t.map$in.utr & t.map$no.df.idx> 0), "--"))
+print(paste0("The amount of UTR-df multi-matches is ", sum(t.map$in.utr & t.map$no.df.idx> 1), "--"))
+
+print(paste0("The amount of Intron symbol matches is ", sum(t.map$in.itr), " (", round(sum(t.map$in.itr)*100/nrow(t.map),1), "%)--"))
+print(paste0("The amount of Intron-df matches is ", sum(t.map$in.itr & t.map$no.df.idx> 0), "--"))
+print(paste0("The amount of Intron-df multi-matches is ", sum(t.map$in.itr & t.map$no.df.idx> 1), "--"))
+
+print(paste0("The amount of double matches is ", sum(t.map$both), " (", round(sum(t.map$both)*100/nrow(t.map),1), "%)--"))
+print(paste0("The amount of double df matches is ", sum(t.map$both & t.map$no.df.idx> 0), "--"))
+print(paste0("The amount of double df multi-matches is ", sum(t.map$both & t.map$no.df.idx> 1), "--"))
+
+
+print(paste0("The amount of no matches is ", sum(df_bm$t.map.idx<0), "--"))
+print(paste0("The amount of one match is ", sum(df_bm$t.map.idx>0), "--"))
+print(paste0("The amount of multi-matches is ", sum(df_bm$t.map.idx==0), "--"))
+
+print(paste0("The amount of HGNC symbols is ", sum(!is.na(df_bm$HGNC.symbol)), "--"))
+```
+
+
+
+
+# Exporting
+export df_bm and then perform experiments elsewhere
+
+```{r}
+stop("Manual running sections ahead.--")
+```
+
+
+```{r}
+
+df_bm <- df_bm[order(as.character(df_bm$entrezgene_id)), ]
+
+time_date <- paste0(Sys.Date(), "--", format(Sys.time(), "%H-%M-%S--"))
+write.csv(df_bm, "P3_outputs/conversion_table.csv", row.names=TRUE)
+write.csv(df_bm, paste0("P3_outputs/archives/", time_date, "conversion_table.csv"), row.names = FALSE)
+
+```
+
+```{r}
+df_bm
+```
+
+# Importing
+
+```{r}
+
+df_bm <- as.data.frame(read_csv("P3_outputs/conversion_table.csv"))
+#df_bm <- as.data.frame(read_csv("P3_outputs/conversion_table_postARED.csv"))
+#df_bm <- as.data.frame(read_csv("P3_outputs/conversion_table_postAREDtwo.csv"))
+rownames(df_bm) <- df_bm$...1
+df_bm <- df_bm[, -1]
+
+df_bm$entrezgene_id <- as.character(df_bm$entrezgene_id)
+  
+if(!exists("df.sigsets")) df.sigsets <- as.data.frame(read_csv("P3_outputs/sigset.met.metadata.csv"))
+# if(!exists("df.sigsets")) df.genes <- as.data.frame(read_csv("P3_outputs/sigset.met.metadata.csv"))
+
+df_bm
+
+```
+
+
+# P2 to P3 
+
+
+```{r}
+# Load in the saved lists of significant genesetes.
+
+# XXX export these from P2 
+
+```
+
+
+
+
+```{r}
+# Manually filling it in.
+
+sig.gs <- List("mmu00053_Ascorbate_and_aldarate_metabolism",               
+            "mmu00232_Caffeine_metabolism",                                
+            "mmu00290_Valine,_leucine_and_isoleucine_biosynthesis",        
+            "mmu00400_Phenylalanine,_tyrosine_and_tryptophan_biosynthesis",
+            "mmu00470_D-Amino_acid_metabolism",                            
+            "mmu00524_Neomycin,_kanamycin_and_gentamicin_biosynthesis",    
+            "mmu00780_Biotin_metabolism",                                  
+            "mmu00785_Lipoic_acid_metabolism",                             
+            "mmu00982_Drug_metabolism",                                    
+            "mmu01100_Metabolic_pathways",                                 
+            "mmu05033_Nicotine_addiction",                                 
+            "mmu05310_Asthma")
+
+```
+
+```{r}
+# Connecting the list values to df_bm
+
+sig.gs <- List("mmu00053_Ascorbate_and_aldarate_metabolism",               
+            "mmu00232_Caffeine_metabolism",                                
+            "mmu00290_Valine,_leucine_and_isoleucine_biosynthesis",        
+            "mmu00400_Phenylalanine,_tyrosine_and_tryptophan_biosynthesis",
+            "mmu00470_D-Amino_acid_metabolism",                            
+            "mmu00524_Neomycin,_kanamycin_and_gentamicin_biosynthesis",    
+            "mmu00780_Biotin_metabolism",                                  
+            "mmu00785_Lipoic_acid_metabolism",                             
+            "mmu00982_Drug_metabolism",                                    
+            "mmu01100_Metabolic_pathways",                                 
+            "mmu05033_Nicotine_addiction",                                 
+            "mmu05310_Asthma")
+
+
+ind.u <- which(colnames(df_bm) %in% "unmatched")
+
+# Create the dataframe and narrow down to the revelant columns.
+names(sig.gs) <- sig.gs
+sig.gs <- (unlist(lapply(sig.gs, function(s) which(names(df_bm) %in% s)) ))
+df_bm.sig.gs <- df_bm[,c(1:ind.u, sig.gs)]
+
+# Narrow down the dataframe to just the revelant genes.
+df_bm.sig.gs <- add_column(df_bm.sig.gs, relevant=FALSE, .before="unmatched")
+for (row_idx in 1:nrow(df_bm.sig.gs)) if(sum(df_bm.sig.gs[row_idx, (ind.u+2):ncol(df_bm.sig.gs)]) > 0) df_bm.sig.gs$relevant[row_idx] <- TRUE
+df_bm.sig.gs.in <-  df_bm.sig.gs[ c(df_bm.sig.gs$relevant), ]
+df_bm.sig.gs.out <- df_bm.sig.gs[!c(df_bm.sig.gs$relevant), ]
+
+# Clean up.
+# XXX relevant in and irrelevant out, not just relevant in
+if (sum(df_bm.sig.gs$relevant)==nrow(df_bm.sig.gs.in))
+{
+  df_bm.sig.gs.in <-  df_bm.sig.gs.in [ ,-c(ind.u)]
+  df_bm.sig.gs.out <- df_bm.sig.gs.out[ ,-c(ind.u)]
+  
+} else stop("You done fucked up the gene cropping--")
+  
+
+# Sanity check.
+print(paste0("The amount of unmatched UTR lengths is ", sum(is.na(df_bm.sig.gs$`3'UTR_max`)), " (", round(sum(is.na(df_bm.sig.gs$`3'UTR_max`))*100/nrow(df_bm.sig.gs),1), "%)--"))
+
+df_bm
+df_bm.sig.gs
+df_bm.sig.gs.in
+df_bm.sig.gs.out
+
+```
+
+
+```{r}
+# In and Out comparison of features.
+
+# Purely for neatness of code to reduce issues when running experiments.
+comparison <- function(df.in, df.out, col) 
+{
+  df.in <- df.in[,col]
+  df.out <- df.out[,col]
+  df.comb <- data.frame("in"=df.in, out=df.out)
+  
+  return(df.comb)
+}
+
+```
+
+```{r}
+sig.gs
+```
+
+
+# Other Stuff
+
+```{r}
+stop("No entry beyond this point.--")
+```
+
+
+## sigset genesis
+
+```{r include=FALSE} 
+# Assemble the superset of differentially expressed genes.
+
+# Path finding variables.
+p.1 <- "P2_outputs/sigsets"
+p.2 <- c("kegg", "msigdb-h", "mousecyc")
+p.3 <- c("apoptosis", "cicd")
+p.4 <- c("up_reg", "down_reg", "mixed")
+
+# Dataframe variables.
+df.sigsets <- data.frame(GeneSet=NA, exp=NA, db=NA, dir=NA)
+
+i <- 0
+j <- 0
+
+# Loop.
+for (p.db in p.2)
+{
+  for (p.e in p.3)
+  {
+    for (p.d in p.4)
+    {
+        # Import dataframe.
+        df.temp <- as.data.frame(read_csv(paste0(p.1, "_", p.db, "_", p.e, "_", p.d, ".csv")))
+        if (p.d == "up_reg") p.d <- "up"
+        if (p.d == "down_reg") p.d <- "down"
+        
+        # Set the first and last indices for the dataframe they'll be appended to.
+        i <- j + 1
+        j <- i - 1 + nrow(df.temp)
+        
+        # Append data when a dataframe has rows to append.
+        if (!(i > j))
+        {
+          df.sigsets[i:j, "db"]  <- p.db
+          df.sigsets[i:j, "exp"] <- p.e
+          df.sigsets[i:j, "dir"] <- p.d
+          for (k in c(1:nrow(df.temp))) df.sigsets$GeneSet[i-1+k] <- df.temp$GENESETS[k]  
+        }
+    }
+  }
+}
+
+```
+
+```{r}
+# Export call.
+
+if(!exists("time_date")) time_date <- paste0(Sys.Date(), "--", format(Sys.time(), "%H-%M-%S--"))
+write.csv(df.sigsets, "P3_outputs/sigset.met.metadata.csv", row.names=FALSE)
+write.csv(df.sigsets, paste0("P3_outputs/archives/", time_date, "sigset.met.metadata.csv"), row.names = FALSE)
+
+```
+
+```{r}
+# Import call.
+
+if(!exists("df.sigsets")) df.sigsets <- as.data.frame(read_csv("P3_outputs/sigset.met.metadata.csv"))
+df.sigsets
+
+```
+
+```{r}
+df.sigsets
+```
+
+## geneset confirmation
+
+Dealing with the 3 month delay between P2 and P3, and the changes in pathway database definitions.
+Confirming our signsets still overlap, though we cannot confirm the genes in the genesets are the same.
+
+```{r}
+
+gs.kegg <- sort(as.data.frame(read_csv("P2_outputs/kegg_results/apoptosis_1_ORA.csv"))$GENE.SET)
+gs.msig <- sort(as.data.frame(read_csv("P2_outputs/msigdb-h_results/apoptosis_1_ORA.csv"))$GENE.SET)
+gs.mcyc <- sort(as.data.frame(read_csv("P2_outputs/mousecyc_results/apoptosis_1_ORA.csv"))$GENE.SET)
+
+# gs.kegg
+# gs.msig
+# gs.mcyc
+
+```
+
+```{r}
+# Confirms the overlap
+
+mmu <- mmu.kegg
+gs  <- gs.kegg
+
+length(sort(names(mmu))[(which(gs %in% sort(names(mmu))))])
+length(sort(names(mmu))[(which(sort(names(mmu)) %in% gs))])
+length(gs)
+((gs == (sort(names(mmu))[(which(sort(names(mmu)) %in% gs))])))
+#names(mmu)
+
+```
+
+```{r}
+#names(mmu.kegg)
+length(which(colnames(df_bm[, -c(1:11)]) %in% names(mmu.kegg)))
+length(which(names(mmu.kegg) %in% colnames(df_bm[, -c(1:11)])))
+
+t.list <- list()
+for (i in c(1:length(mmu.kegg))) if (length(which(colnames(df_bm[, -c(1:11)]) %in% names(mmu.kegg)[i]))>0) t.list[[length(t.list)+1]] <- (which(colnames(df_bm[, -c(1:11)]) %in% names(mmu.kegg)[i]))
+
+unlist(t.list) == 1:348
+```
+
+## download cDNA data
+
+```{r}
+# Exporting the cDNA databases in small steps.
+
+i <- 0
+n <- 500
+reached.end <- FALSE
+i.max <- length(unique(df_bm$entrezgene_id))
+
+# Remove the variable to make sure there's no information contamination.
+if (exists("t.cnda")) rm(t.cdna)
+
+feature <- "cdna"
+#feature <- "3utr"
+#feature <- "5utr"
+
+while (!reached.end)
+{
+  # Handle indicie magic.
+  i <- i + 1
+  i.start <- (i*n) - n + 1
+  i.end <- min((i*n), i.max)
+  
+  print(paste0("Processing ", i, "/", ceiling(i.max/n), " of ", feature, "'s queries.--"))
+  
+  # In chunks of n (500), grab the cDNAs associated with the EntrezIDs.
+  t.cdna <- as.data.frame(getBM(attributes=c("entrezgene_id", feature), mart=mart,
+                                filters=c("entrezgene_id"), values=unique(df_bm$entrezgene_id[i.start:i.end])))
+  
+
+  # Reorder the data then remove "Sequence unavailable" entries.
+  t.cdna <- t.cdna[order(t.cdna$entrezgene_id),]
+  t.ind <- which(t.cdna[, feature] %in% "Sequence unavailable")
+  if (length(t.ind) > 0) t.cdna <- t.cdna[-t.ind, ]
+  rm(t.ind)
+
+  # Then export them.
+  # (Set based on which feature you're grabbing.)
+  write.csv(t.cdna, paste0("P3_outputs/the_cdna_archives/", feature, "_portion_", i, ".csv"), row.names=FALSE )
+
+  # Remove the variable to make sure there's no information contamination
+  rm(t.cdna)
+  
+  
+  # Base case check.
+  if (i.end == i.max) reached.end <- TRUE
+}
+  
+```
+
+```{r}
+t.cdna <- as.data.frame(getBM(attributes=c("entrezgene_id", "3utr"), mart=mart,
+                                filters=c("entrezgene_id"), values=unique(df_bm$entrezgene_id)))
+```
+
+```{r}
+t.cdna <- as.data.frame(getBM(attributes=c("entrezgene_id", "3utr"), mart=mart,
+                                filters=c("entrezgene_id"), values=unique(df_bm$entrezgene_id[1:50])))
+```
+```{r}
+
+as.data.frame(getBM(attributes=c("entrezgene_id", "3utr"), mart=mart,
+                                filters=c("entrezgene_id"), values=unique(df_bm$entrezgene_id[1])))
+
+as.data.frame(getBM(attributes=c("entrezgene_id", "5utr"), mart=mart,
+                                filters=c("entrezgene_id"), values=unique(df_bm$entrezgene_id[1])))
+```
+
+
+
+## AURA2
+
+```{r}
+# Get AURA2's light data.
+
+# Import the txt tables.
+df.aura.cis <- as.data.frame(read.csv("data/AURAlight_cis-elements.txt", sep="\t"))
+df.aura.trans <- as.data.frame(read.csv("data/AURAlight_trans-factors.txt", sep="\t"))
+
+# Crop out the target UTRs that are human.
+df.aura.cis <- df.aura.cis[substr(df.aura.cis$Target.UTR,1,4)!="hg19", ]
+df.aura.trans <- df.aura.trans[substr(df.aura.trans$Target.UTR,1,4)!="hg19", ]
+
+# Display the data.
+df.aura.cis
+df.aura.trans
+
+# https://bioinfo.umassmed.edu/pub/data/ucsc_into_genesymbol.rsem
+# https://www.genecards.org/cgi-bin/carddisp.pl?gene=NEURL3
+
+```
+
+```{r}
+# Check the mapping between the two data frames.
+
+print(paste0("CIS:  ", dim(df.aura.cis[which(df.aura.cis$Target.Gene %in% df.bm$gene_symbols), ])[1], 
+             "/", dim(df.aura.cis)[1]))
+print(paste0("dfBM: ", dim(df.bm[(which(df.bm$gene_symbols %in% df.aura.cis$Target.Gene)), ])[1], 
+             "/", dim(df.bm)[1]))
+
+print(paste0("TRANS: ", dim(df.aura.trans[which(df.aura.trans$Target.Gene %in% df.bm$gene_symbols), ])[1], 
+             "/", dim(df.aura.trans)[1]))
+print(paste0("dfBM:  ", dim(df.bm[(which(df.bm$gene_symbols %in% df.aura.trans$Target.Gene)), ])[1], 
+             "/", dim(df.bm)[1]))
+
+```
+
+```{r}
+df.aura.cis[df.aura.cis$Target.Gene=="ADARB1", ]
+df.aura.trans[df.aura.trans$Target.Gene=="ADRM1", ]
+```
+
+```{r}
+# Both have duplicates... so we'll use lists to bind the df_bm entries to the AURA2 indices!
+# Since lists are used, the NaN values appear as a list of logicals while index lists are integers.
+
+df.bm$aura.cis <- NA
+df.bm$aura.trans <- NA
+for (i in c(1:nrow(df.bm)))
+{
+  j <- which(df.aura.cis$Target.Gene %in% df.bm$gene_symbols[i])
+  if (length(j) > 0) df.bm$aura.cis[i] <- list(j)
+  
+  j <- which(df.aura.trans$Target.Gene %in% df.bm$gene_symbols[i])
+  if (length(j) > 0) df.bm$aura.trans[i] <- list(j)
+}
+
+# df.bm[, c(1, 18,19)]
+
+```
+
+```{r}
+#table(df.aura.cis$Cis.element)
+#table(df.aura.trans$Regulatory.factor)
+table(df.aura.cis$Target.Gene)
+table(df.aura.trans$Target.Gene)
+```
+
+```{r}
+# Create a dataframe containing all the comparative data between the two treatments.
+
+# c.ind <- c("a.u", "c.u", "a.d", "c.d", "a.m", "c.m")
+# c.row <- c("are.genes", "total.genes", "are.percent", "are.mean")
+# df.exp <- data.frame(exp=c.ind)
+# rownames(df.exp) <- df.exp$exp
+# df.exp <- df.exp[, -c(1)]
+# 
+# # Absolute values
+# for (i in c(1:length(c.ind)))
+# {
+#   df.exp[i, "are.genes"]   <- sum(as.integer((df.bm[, c.ind[i]])&(df.bm$ared>0)) > 0)
+#   df.exp[i, "total.genes"] <- sum(as.integer( df.bm[, c.ind[i]]) > 0)
+#   df.exp[i, "are.pecent"] <- df.exp[i, "are.genes"] * 100 / df.exp[i, "total.genes"]
+#   df.exp[i, "are.mean"] <- mean(as.integer( df.bm[df.bm[, c.ind[i]], "ared"]>0 )) # effectively useless...
+#   
+#   if (i %% 2 == 0) 
+#       df.exp[c((i-1):i), "t.test"] <- round(t.test(as.integer( df.bm[df.bm[, c.ind[i]]  , "ared"]>0 ),
+#                                                    as.integer( df.bm[df.bm[, c.ind[i-1]], "ared"]>0 ))$p.value, 6)
+# 
+#   
+# }
+# 
+# df.exp.aura <- df.exp
+# rm(df.exp)
+# df.exp.aura
+# t_pose(df.exp.aura)
+
+```
+
+
+## Get poly(A)sites
+
+```{r}
+# Mus musculus: v2.0 (GRCm38.96)  //  Date of release: 20/04/2020
+# Source: https://polyasite.unibas.ch/atlas
+
+fatty.df <- read.csv("data/atlas.clusters.2.0.GRCm38.96.csv", sep="\t")
+fatty.df <- as.data.frame(fatty.df)
+
+#colnames(fatty.df)
+fatty.df
+
+```
+
+```{r}
+as.data.frame(fatty.df$gene_name)
+as.data.frame(df_bm$gene_symbols)
+```
+
+```{r}
+
+# Subset the giant dataframe to the relevant genes.
+idx.gene.sym <- which(fatty.df$gene_name %in% df_bm$gene_symbols)
+tail.df <- fatty.df[idx.gene.sym, c(1, 5, 7:13)]
+colnames(tail.df)[which(colnames(tail.df) %in% "gene_name")] <- "gene_symbols"
+tail.df
+
+```
+
+```{r}
+
+length(unique(fatty.df[idx.gene.sym, "gene_symbols"]))
+length(unique(df_bm$gene_symbols))
+
+print(paste0("PolyA: ", length(which(tail.df$gene_symbols %in% df_bm$gene_symbols)), "/", nrow(tail.df)))
+print(paste0("dfBM: ", length(which(df_bm$gene_symbols %in% tail.df$gene_symbols)), "/", nrow(df_bm)))
+
+```
+
+
+```{r}
+# Map polyAsite entries to the df_bm entries.
+
+if (length(which(colnames(df_bm) %in% "nr.PAS")) == 0) 
+  df_bm <- add_column(df_bm, nr.PAS=NA, .before="gene_symbols") # XXX change later 
+if (length(which(colnames(tail.df) %in% "df_bm.idx")) == 0) 
+  tail.df <- add_column(tail.df, df_bm.idx=NA, .before="gene_symbols") # XXX change later 
+
+# Find and append.
+for (i in 1:nrow(tail.df))
+{
+  tail.df[i, "df_bm.idx"] <- which(df_bm$gene_symbols %in% tail.df$gene_symbols[i])[1]
+  # XXX some connect to multiple rows due to the duplicate issue.
+  df_bm[tail.df[i, "df_bm.idx"], "nr.PAS"] <- length(which(df_bm$gene_symbols %in% tail.df$gene_symbols[i]))
+}
+
+tail.df
+df_bm
+
+```
+
+```{r}
+# Print statistics.
+
+print(paste0(sum(!is.na(tail.df$df_bm.idx)), "/", nrow(tail.df)))
+print(paste0(sum(!is.na(df_bm$nr.PAS)),     "/", nrow(df_bm)))
+
+table(df_bm$nr.PAS)
+
+```
+```{r}
+table(tail.df$frac_samples)
+```
+
+```{r}
+
+table(tail.df$nr_prots)
+table(tail.df$annotation)
+
+table(tail.df$nr_prots, tail.df$annotation)
+
+```
+
+```{r}
+
+# Filter the tail.df.
+
+n <- 2
+m <- c("TE")
+o <- 0.1
+
+# df_bm[unique(tail.df[(tail.df$nr_prots>=n)&(tail.df$annotation==m), "df_bm.idx"]), ]
+
+for (i in c(1:max(tail.df$nr_prots))) 
+  print(paste0(i, ": ", nrow(df_bm[unique(tail.df[(tail.df$nr_prots>=i)&
+                                                    (tail.df$annotation==m)&
+                                                    (tail.df$frac_samples>=o), 
+                                                  "df_bm.idx"]), ])))
+
+```
+
+
+```{r}
+# Gather the poly(A) signals per gene.
+
+signal.df <- data.frame(gene_symbols=NA, polyAsite.signal=NA, df_bm.idx=NA, # values
+                        annotation=NA, frac_sample=NA, nr_prots=NA) # filters
+
+for (i in 1:nrow(tail.df))
+{
+  str.i <- tail.df$repSite_signals[i]
+  
+  if (!is.na(str.i))
+    for (j in str_split_1(str.i, ":"))
+      signal.df <- add_row(signal.df, 
+                           gene_symbols=tail.df$gene_symbols[i], 
+                           polyAsite.signal=substring(j, 1, 6), 
+                           df_bm.idx=tail.df$df_bm.idx[i],
+                           annotation=tail.df$annotation[i],
+                           frac_sample=tail.df$frac_samples[i],
+                           nr_prots=tail.df$nr_prots[i])
+}
+
+signal.df <- signal.df[-1, ]
+rownames(signal.df) <- NULL
+signal.df
+
+```
+
+
+```{r}
+table(signal.df$polyAsite.signal)
+```
+
+
+## duplicate counts
+
+```{r}
+
+print(paste0("The dimensions of df_bm are: ", list(dim(df_bm))))
+print(paste0("Number of unique Entrez IDs: ", length(unique(df_bm$entrezgene_id))))
+r.d <- df_bm[unlist(dup_feature(df_bm, "entrezgene_id")[1]), "entrezgene_id"]
+#print(paste0("Number of duplicated rows: ", length(r.d), " (", as.percent.abs(length(r.d), nrow(df_bm)), ")"))
+print(paste0("Number of duplicated rows: ", length(r.d)))
+print(paste0("Number of duplicated IDs: ", length(unique(r.d))))
+print(paste0("Number of additional rows: ", - length(unique(r.d)) + length(r.d)))
+
+print(paste0("Number of UTR ARE havers is: ", length(unique(df_bm$ared.utr)), ", which can be expressed as:" ))
+as.percent.abs(length(unique(df_bm$ared.utr)), length(unique(df_bm$entrezgene_id)))
+
+```
+
+```{r}
+
+if (!exists("mmu.gs")) 
+{
+  mmu.kegg <- EnrichmentBrowser::getGenesets(org="mmu", db="kegg")
+  mmu.msigdb <- EnrichmentBrowser::getGenesets(org="mmu", db="msigdb")
+  mmu.mousecyc <- get_mousecyc()
+  
+  mmu.genesets <- c(mmu.kegg, mmu.msigdb, mmu.mousecyc)
+  
+} else mmu.genesets <- mmu.gs 
+
+mmu.genes <- as.data.frame(unique(unlist(mmu.genesets)))
+colnames(mmu.genes)[1] <- "entrezgene_id"
+
+# Create a list corresponding to the BioMart's matching Entrez IDs and fill it.
+mmu.genes["match_idx"] <- NA
+
+for (g in 1:nrow(mmu.genes))
+{
+  mmu.genes[g, "match_idx"] <- match(mmu.genes$entrezgene_id[g], df_bm$entrezgene_id)[1]
+}
+
+# Order by EntrezID.
+mmu.genes <- mmu.genes[order(mmu.genes$entrezgene_id),]
+
+print(sum(is.na(mmu.genes$match_idx))) # XXX get back to this later
+mmu.genes
+
+```
+
+
+
+
+# End

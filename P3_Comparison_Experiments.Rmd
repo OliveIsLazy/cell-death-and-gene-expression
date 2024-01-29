@@ -1,0 +1,2551 @@
+---
+title: "P3 Comparison Experiments"
+author: "Olive Kirk"
+date: "08/11/2022"
+output: pdf_document
+---
+
+Similar to P2_Visualisation.Rmd where the data generated from P3_TCGA_Sequences.Rmd are visualised.
+Figures comparing the UTR lengths and GC proportions, with and without AREs are produced.
+Tables for the proportions of bene-regulation per experiment are produced.
+
+Colours curtesy of https://pmassicotte.github.io/paletteer_gallery/
+
+
+# Imports
+```{r include=FALSE} 
+# Import libraries.
+
+knitr::opts_chunk$set(echo = TRUE)
+
+# Core computational packages.
+library(stats)
+library(matrixStats)
+
+# Visualisation packages.
+library(ggplot2)
+library(patchwork)
+library(paletteer)
+library(stringr)
+
+# Coding preference packages.
+library(readr)
+library(tibble)
+library(data.table)
+library(dplyr)
+
+
+# Setting other stuff.
+set.seed(42)
+options("scipen"=10, "digits"=4)
+time_date <- paste0(Sys.Date(), "--", format(Sys.time(), "%H-%M-%S--"))
+alpha <- 0.05
+
+
+# Set output paths and generate the folders if needed.
+path.f <- "P3_outputs/figures"
+path.n <- "P3_outputs/numerics"
+if (!dir.exists(path.f)) dir.create(path.f)
+if (!dir.exists(path.n)) dir.create(path.n)
+
+```
+
+
+
+
+## helper methods
+
+
+```{r}
+
+#' Input the filters for df.gs and get the corresponding genes from df.g.
+#' filter.list is a list of lists, where a sublist is the df.gs column name
+#' along with the value to be filtering by via equality, e.g.:
+#' filter.list <- list(list("mixed", "A"))
+#' filter.list <- list(list("mixed", "A"), list("db", "kegg"))
+gs_to_gene <- function (df.gs, df.g, filter.list)
+{
+  # Grab the relevant genesets from df.gs (uses a top down filtering approach).
+  gs.names <- df.gs$geneset
+  for (i in filter.list)
+  {
+    idx.crop <- which(gs.names %in% df.gs[df.gs[, i[[1]]] == i[[2]], "geneset"])
+    gs.names <- gs.names[idx.crop]
+  }
+  
+  # Crop to the ones exist in the df.g.
+  idx.gs <- colnames(df.g)[which(colnames(df.g) %in% gs.names)]
+  # print(idx.gs)
+  
+  # Grab the corresponding geneset columns filled with boolean values,
+  # then identify the rows with even one TRUE value in it.
+  idx.g <-  rowSums(as.data.frame(df.g[, idx.gs])) > 0
+  
+  # Return
+  res <- df.g[idx.g, "entrezgene_id"]
+  return(res)
+}
+
+```
+
+```{r}
+# Handling the duplicate-row issue for processing each feature.
+
+#' Finds out which duplicated rows in df share the same value wrt feature f.
+#' This method is to be used for t-test comparisons to prevent bias from duplicates.
+#' This method sets entries where the feature ID is NA to FALSE i.e. it's not complete.
+#' 
+#' df     the dataframe to be checked dataframe
+#' f      feature to be checked for duplicates, will be reassigned to its "ID feature"
+#' 
+#' return a boolean of the rows to be kept
+dup_feature <- function(df, f, only.in=FALSE) {
+  
+  
+  # Stop checks because why not.
+  if (length(which(colnames(df) %in% f)) == 0)
+    stop("The feature is not in the dataframe.--")
+  
+  if (length(which(c("refseq_mrna", "refseq_mrna_predicted", "ared.utr", "ared.itr") %in% f)) > 0)
+    stop("This is a ID feature, please choose one of its corresponding value feature instead.--")
+  
+  if (length(which(c("5'UTR_N", "3'UTR_N", "5'UTR_X",   "3'UTR_X", 
+                      "ared", "gc.proportion", "gc.prop", "gc.count", "seq.length") %in% f)) == 0)
+    stop("The feature is not one we care about, I will not process it.--")
+  
+  
+  # Set the feature IDs used to identify which entries are duplicates.
+  if (length(which(c("5'UTR_N",   "3'UTR_N") %in%   f)) > 0)  f.id <- "refseq_mrna"
+  if (length(which(c("5'UTR_X",   "3'UTR_X") %in%   f)) > 0)  f.id <- "refseq_mrna_predicted"
+  
+  if (length(which(c("ared", "gc.proportion", "gc.prop", "gc.count", "seq.length") %in% f)) > 0) f.id <- "ared.utr"
+  
+  
+  
+  # Set all rows to be dropped by default to ensure NO duplicates.
+  df$keep <- FALSE
+  
+  for (i in c(1:nrow(df)))
+  {
+    # Find which rows are duplicate rows for row i (a sorted list in ascending order).
+    j <- which(df$entrezgene_id %in% df$entrezgene_id[i])
+    if (length(j) == 1) 
+      df$keep[i] <- TRUE
+      
+    
+    if (length(j) >  1)
+    {
+      # if (is.na(df[i, f.id]))
+      #   print(j)
+      
+      # Sort in ascending order then stratify by feature ID, then sort again in ascending order.
+      j <- sort(j)
+      k <- j[which(df[j, f.id] %in% df[i, f.id])]
+      k <- sort(k)
+      
+      # In cases of a true duplicate (only one ID corresponding to only one value).
+      if ((length(unique(df[k, f])) == 1) & (length(unique(df[k, f.id])) == 1))
+      {
+        df$keep[k[1]] <- TRUE
+        next
+      }
+      # In the case where every duplicate row has a unique feature ID.
+      if (length(unique(df[k, f])) == length(k))
+      {
+        df$keep[k] <- TRUE
+        next
+      }
+      
+      # Find the identical feature values for this one feature ID and save the lowest index.  
+      idx.df  <- (df[i, f] == df[k, f])
+      idx.idx <- which(idx.df %in% TRUE)  
+      if (length(idx.idx) > 0)
+        df$keep[k[idx.idx][1]] <- TRUE
+      }
+  }
+  
+  return (df$keep)
+}
+
+```
+
+```{r}
+
+#' Transpose matrix and retain the name values.
+t_pose <- function(d) {
+  print(typeof(d))
+  df_t <- data.table::transpose(d)
+  print(typeof(df_t))
+  rownames(df_t) <- colnames(d)
+  colnames(df_t) <- rownames(d)
+  d <- df_t
+  
+  return(d)
+}
+
+```
+
+```{r}
+
+#' Creates a table from a dataframe and the specified columns.
+#' 
+#' df   the dataframe to have its column frequencies counted up
+#' col  vector of the desired columns
+#' deg  the degree the results should be rounded to for numerical columns
+#' t    whether or not the results should the transposed to rows being variables
+#' h    whether or not to divide the results in half (for apoptosis-CICD splits)
+#' 
+#' res  a dataframe
+table.to.data.frame <- function(df, col, deg=2, t=T, h=F) {
+  
+  # Create the dataframe and rename the columns to their variables as needed.
+  res <- as.data.frame(table(df[, col]))
+  if (length(col) == 1)
+    names(res)[which(colnames(res) %in% "Var1")] <- col[1]
+  
+  # Perform rounding if needed.
+  for (i in 1:length(col))
+  {
+    res[, i] <- as.character(res[, i])
+    
+    if(!any(is.na(as.numeric(res[, i]))))
+      res[, i] <- round(as.numeric(res[, i]), deg)
+  }
+  
+  # Formatting for LaTeX aesthetics.
+  res <- res[!res$Freq==0, ]
+  print(res)
+  if (h) res$percentage <- round(res$Freq*50 /sum(res$Freq), deg)
+  else   res$percentage <- round(res$Freq*100/sum(res$Freq), deg)
+  res$percentage <- paste0("$", res$percentage, "%$")
+  res <- res[, -which(colnames(res) %in% "Freq")]
+  if (t) res <- t_pose(res)
+  colnames(res) <- NULL
+  
+  return(res)
+}
+
+```
+
+```{r}
+
+#' Method for running statistics test on data w/ and w/o AREs.
+#' Often called in a loop pointing to the gene-regulation values
+#' 
+#' df         dataframe containing the data e.g. df.gtwo
+#' x          first gene-regulation category 
+#' y          second gene-regulation category 
+#' are.list   list of the ARE values and a null for the full dataset
+#' 
+#' returns the list of results as a dataframe
+stat.tests <- function(df, x, y, f, are.list=c("", rev(levels(df.gtwo$ared))) ) {
+  
+  res.df <- NA
+  
+  if (x == "" | y == "") 
+    c.deg <- list(df$deg, df$deg) 
+  else 
+    c.deg <- c(x, y)
+  
+  for (k in are.list)
+  {
+    if (k == "") 
+      col2 <- TRUE 
+    else 
+      col2 <- df.gtwo$ared==k
+    
+    for (l in are.list)
+    {
+      # Skip statements.
+      if ((k != "" & l == "") || (k == "" & l != ""))
+        next
+      if (k == "Without ARE" & l == "With ARE")
+        next
+      if (x==y & k==l)
+        next
+      
+      if (k == "" & l == "")
+        col3 <- col2 
+      else 
+        col3 <- df.gtwo$ared==l
+      
+      # stat.res[nrow(stat.res)+1, ] <- stat.tests(df.gtwo, i, j, "utr", col2, col3)
+      
+      df.in  <- df[df$deg==c.deg[[1]] & col2, f]
+      df.out <- df[df$deg==c.deg[[2]] & col3, f]
+      
+      res<- c(x, y, f, k, l,
+              as.numeric(ks.test(df.in, df.out)$p.value) > alpha,
+              as.numeric(wilcox.test(df.in, df.out)$p.value) > alpha,
+              as.numeric(shapiro.test(df.in [sample(1:min(5000, nrow(df.in) ))])$p.value) > alpha,
+              as.numeric(shapiro.test(df.out[sample(1:min(5000, nrow(df.out)))])$p.value) > alpha,
+              as.numeric(t.test(df.in, df.out)$p.value) > alpha,
+              length(df.in), length(df.out))
+      res.df <- rbind(res.df, res)
+    } 
+  }
+  
+  res.df <- as.data.frame(res.df[-1, ])
+  if (ncol(res.df) == 1) 
+    res.df <- t_pose(res.df)
+  rownames(res.df) <- NULL
+    
+  return(res.df)
+}
+
+```
+
+
+
+
+## dataframes
+
+```{r}
+# Set experiment naming titles.
+
+exp.short <- c("apop", "CICD")
+reg.list <- c("up_reg", "down_reg", "static")
+sep.v <- " "
+join.v <- " & "
+
+deg.a.factors <- paste0(rep(reg.list[c(3,1,2)]), " ", exp.short[1])
+deg.c.factors <- paste0(rep(reg.list[c(3,1,2)]), " ", exp.short[2])
+
+
+deg.factors   <- paste0(paste0(rep(reg.list[c(1,3,2)], each=3), sep.v, exp.short[1]), join.v,
+                      paste0(rep(reg.list[c(1,3,2)],      3), sep.v, exp.short[2]))
+deg.factors.2 <- c(deg.a.factors[1], deg.c.factors[1], 
+                 deg.a.factors[2], deg.c.factors[2], 
+                 deg.a.factors[3], deg.c.factors[3])
+
+```
+
+
+```{r}
+# dataframe
+
+# df.t <- as.data.frame(read_csv("P2_outputs/processed P1 results.csv"))
+# df.t$static.a <- !(df.t$upreg.a | df.t$downreg.a)
+# df.t$static.c <- !(df.t$upreg.c | df.t$downreg.c)
+
+df.t <- as.data.frame(read_csv("P1_outputs/df_rep_genelist.csv"))
+df.t <- df.t[, c(which(colnames(df.t) %in% "ENTREZID"),
+             which(colnames(df.t) %in% "upreg.a"),
+             which(colnames(df.t) %in% "upreg.c"),
+             which(colnames(df.t) %in% "downreg.a"),
+             which(colnames(df.t) %in% "downreg.c"))]
+
+# Append then set static boolean columns.
+df.t <- add_column(df.t, static.a = TRUE, .after="downreg.c")
+df.t <- add_column(df.t, static.c = TRUE, .after="static.a")
+
+df.t[df.t$upreg.a,   "static.a"] <- FALSE
+df.t[df.t$downreg.a, "static.a"] <- FALSE
+df.t[df.t$upreg.c,   "static.c"] <- FALSE
+df.t[df.t$downreg.c, "static.c"] <- FALSE
+
+
+df.t$deg.a <- NA
+df.t$deg.c <- NA
+df.t$deg   <- NA
+
+df.t[as.logical(df.t$upreg.a),   "deg.a"] <- paste0(reg.list[1], sep.v, "apop")
+df.t[as.logical(df.t$downreg.a), "deg.a"] <- paste0(reg.list[2], sep.v, "apop")
+df.t[as.logical(df.t$static.a),  "deg.a"] <- paste0(reg.list[3], sep.v, "apop")
+df.t$deg.a <- factor(df.t$deg.a, deg.a.factors)
+
+df.t$deg.c <- NA
+df.t[as.logical(df.t$upreg.c),   "deg.c"] <- paste0((reg.list[1]), sep.v, "CICD")
+df.t[as.logical(df.t$downreg.c), "deg.c"] <- paste0((reg.list[2]), sep.v, "CICD")
+df.t[as.logical(df.t$static.c),  "deg.c"] <- paste0((reg.list[3]), sep.v, "CICD")
+df.t$deg.c <- factor(df.t$deg.c, deg.c.factors)
+
+df.t$deg <- paste0(substring(df.t$deg.a, 1, str_locate(df.t$deg.a, fixed("apop"))[, 1]-1),  exp.short[1],
+   join.v, (substring(df.t$deg.c, 1, str_locate(df.t$deg.c, fixed("CICD")     )[, 1]-1)), exp.short[2])
+
+df.t$deg[is.na(df.t$deg.a)] <- NA
+df.t$deg[is.na(df.t$deg.c)] <- NA
+
+df.t$deg <- factor(df.t$deg, deg.factors)
+
+df.full <- df.t
+rm(df.t)
+
+```
+
+```{r}
+# Import the bulk of the P3 processed data (VERY large, do not visualise past column index 35).
+# [a.u vs upreg.a what?	--> ignore a.u]
+
+# Import.
+df.g <- as.data.frame(read_csv("P3_outputs/conversion_table.csv"))
+rownames(df.g) <- df.g[, 1]
+df.g <- df.g[, -1]
+df.g <- df.g[, -c(which(colnames(df.g) %in% "a.u"):which(colnames(df.g) %in% "c.m"))]
+
+cols.to.keep <- c(1:which(colnames(df.g) %in% "gene.idx"))
+df.g <- df.g[, cols.to.keep]
+df.g <- df.g[df.g$gene.idx!=0, ]
+rm(cols.to.keep)
+
+# Correct the regulation values.
+for (i in 1:nrow(df.g))
+  df.g[i,    c(which(colnames(df.g)    %in% "upreg.a"):which(colnames(df.g)    %in% "static.c"))] <-
+  df.full[which(df.full$ENTREZID %in% df.g$entrezgene_id[i]), 
+             c(which(colnames(df.full) %in% "upreg.a"):which(colnames(df.full) %in% "static.c"))]
+
+
+# Process for science.
+df.g$deg.a <- NA
+# df.g[as.logical(df.g$upreg.a),   "deg.a"] <- paste0(reg.list[1], sep.v, "Apoptosis")
+# df.g[as.logical(df.g$downreg.a), "deg.a"] <- paste0(reg.list[2], sep.v, "Apoptosis")
+# df.g[as.logical(df.g$static.a),  "deg.a"] <- paste0(reg.list[3], sep.v, "Apoptosis")
+# df.g$deg.a <- factor(df.g$deg.a, paste0(reg.list, sep.v, "Apoptosis"))
+df.g[as.logical(df.g$upreg.a),   "deg.a"] <- paste0(reg.list[1], sep.v, "apop")
+df.g[as.logical(df.g$downreg.a), "deg.a"] <- paste0(reg.list[2], sep.v, "apop")
+df.g[as.logical(df.g$static.a),  "deg.a"] <- paste0(reg.list[3], sep.v, "apop")
+df.g$deg.a <- factor(df.g$deg.a, deg.a.factors)
+
+# df.g$deg.c <- NA
+# df.g[as.logical(df.g$upreg.c),   "deg.c"] <- paste0(toupper(reg.list[1]), sep.v, "CICD")
+# df.g[as.logical(df.g$downreg.c), "deg.c"] <- paste0(toupper(reg.list[2]), sep.v, "CICD")
+# df.g[as.logical(df.g$static.c),  "deg.c"] <- paste0(toupper(reg.list[3]), sep.v, "CICD")
+# df.g$deg.c <- factor(df.g$deg.c, paste0(toupper(reg.list), sep.v, "CICD"))
+df.g$deg.c <- NA
+df.g[as.logical(df.g$upreg.c),   "deg.c"] <- paste0((reg.list[1]), sep.v, "CICD")
+df.g[as.logical(df.g$downreg.c), "deg.c"] <- paste0((reg.list[2]), sep.v, "CICD")
+df.g[as.logical(df.g$static.c),  "deg.c"] <- paste0((reg.list[3]), sep.v, "CICD")
+df.g$deg.c <- factor(df.g$deg.c, deg.c.factors)
+
+
+
+# df.g$deg <- paste0(df.g$deg.a, sep.v, exp.short[1], join.v, df.g$deg.c, sep.v, exp.short[2])
+
+# df.g$deg <- paste0(substring(df.g$deg.a, 1, str_locate(df.g$deg.a, fixed("Apoptosis"))[, 1]-1), exp.short[1],
+#            join.v, substring(df.g$deg.c, 1, str_locate(df.g$deg.c, fixed("CICD")     )[, 1]-1), exp.short[2])
+
+# df.g$deg <- paste0(substring(df.g$deg.a, 1, str_locate(df.g$deg.a, fixed("Apoptosis"))[, 1]-2),
+#    join.v, toupper(substring(df.g$deg.c, 1, str_locate(df.g$deg.c, fixed("CICD")     )[, 1]-2)))
+
+# df.g$deg <- paste0(substring(df.g$deg.a, 1, str_locate(df.g$deg.a, fixed("Apoptosis"))[, 1]-1),  exp.short[1],
+   # join.v, toupper(substring(df.g$deg.c, 1, str_locate(df.g$deg.c, fixed("CICD")     )[, 1]-1)), exp.short[2])
+df.g$deg <- paste0(substring(df.g$deg.a, 1, str_locate(df.g$deg.a, fixed("apop"))[, 1]-1),  exp.short[1],
+   join.v, (substring(df.g$deg.c, 1, str_locate(df.g$deg.c, fixed("CICD")     )[, 1]-1)), exp.short[2])
+
+df.g$deg[is.na(df.g$deg.a)] <- NA
+df.g$deg[is.na(df.g$deg.c)] <- NA
+df.g$deg <- factor(df.g$deg, deg.factors)
+
+df.g[df.g$ared==TRUE,  "ared"] <- "With ARE"
+df.g[df.g$ared==FALSE, "ared"] <- "Without ARE"
+df.g$ared <- factor(df.g$ared, rev(unique(df.g$ared)))
+
+names(df.g)[which(colnames(df.g) %in% "gc.proportion")] <- "gc.prop"
+df.g <- add_column(df.g, gc.count=(df.g$gc.prop*df.g$seq.length), .after="gc.prop")
+
+df.g
+
+
+# Removing duplicates (yes I'm serious this was a terrible idea oh my God).
+if (TRUE)
+{
+  df.g$checked <- FALSE
+  df.g$to.drop <- FALSE
+  
+  for (i in c(1:nrow(df.g)))
+  {
+    
+    if (df.g$checked[i])
+      next
+    
+    j <- which(df.g$entrezgene_id %in% df.g$entrezgene_id[i])
+    if (length(j) == 1) 
+      next
+      
+    j <- sort(j)
+    
+    for (n in 1:length(j))
+    {
+      for (m in (n+1):length(j))
+      {
+        # all.equal(as.list(df.g[idx.dup[51], ]), as.list(df.g[idx.dup[52], ]))
+        if (length(all.equal(as.list(df.g[j[n], ]), as.list(df.g[j[m], ]))) == 1)
+          df.g$to.drop[j[m]] <- TRUE
+      }
+    }
+    
+    df.g$checked[j] <- TRUE
+  }
+  
+  df.g <- df.g[!df.g$to.drop, ]
+  df.g <- df.g[, -which(colnames(df.g) %in% c("checked", "to.drop"))]
+}
+
+# Re-ordering the dataframe for relevant-variable clartiy.
+for (c in colnames(df.g)[c(13,
+                           1,2,
+                           4,7,10,8,11,6,9,
+                           12,14,15,19:26)])
+{
+  idx <- which(colnames(df.g) %in% c)
+  t       <- df.g[,  idx]
+  df.g <- df.g[, -idx]
+  df.g[, c] <- t
+}
+
+
+#df.g[, 1:29]
+df.g
+#df.g[, c(1:3, 13:15)]
+
+```
+
+```{r} 
+# Generate the dataframe connecting the genesets to their enrichment status.
+# NOTE: there is an issue with WikiPathways, but this is fine because it's inaccessible regardless.
+
+df.gs   <- NA
+
+for (db in db.list <- c("kegg", "go", "msigdb-h", "wikipathways", "reactome", "mousecyc"))
+{
+  df.temp <- as.data.frame(read_csv(paste0("P2_outputs/sigsets/dataframe_", db, ".csv")))
+  df.temp$db <- db
+  df.gs <- rbind(df.gs, df.temp)
+}
+
+df.gs <- df.gs[-1, ]
+rownames(df.gs) <- NULL
+rm(df.temp)
+
+
+# Redo naming convention for coding berevity later.
+for (c in c("mixed", "up_reg", "down_reg"))
+{
+  idx <- which(df.gs[, c] %in% "only_apoptosis")
+  df.gs[idx, c] <- "A"
+
+  idx <- which(df.gs[, c] %in% "only_CICD")
+  df.gs[idx, c] <- "C"
+
+  idx <- which(df.gs[, c] %in% "intersect")
+  df.gs[idx, c] <- "B"
+
+  idx <- is.na(df.gs[, c])
+  df.gs[idx, c] <- "N"
+}
+
+df.gs
+
+```
+
+```{r}
+# Import the 3'UTR cDNA experiment results.
+
+df.cdna <- as.data.frame(read_csv("P3_outputs/3utr_cDNA_analysis.csv"))
+df.cdna <- df.cdna[, -c(which(colnames(df.cdna) %in% "a.u"):which(colnames(df.cdna) %in% "c.m"))]
+
+df.cdna <- df.cdna[, -c(which(colnames(df.cdna) %in% "average.GC"):which(colnames(df.cdna) %in% "shortest.sequence"))]
+df.cdna[!is.na(df.cdna$sequence), ] 
+
+
+
+# Editing for science.
+df.cdna <- add_column(df.cdna, gc.count=(df.cdna$gc.prop*df.cdna$length), .after="gc.prop")
+
+df.cdna$sorted  <- FALSE
+df.cdna$matched <- FALSE
+
+
+df.cdna$deg.a <- NA
+df.cdna$deg.c <- NA
+df.cdna$deg   <- NA
+df.cdna$ared  <- FALSE
+
+entrez.id <- unique(df.cdna$entrezgene_id)
+
+
+for (i in 1:length(entrez.id))
+{
+  # Skip.
+  if (df.cdna$sorted[i])
+    next
+  
+  j <- which(df.cdna$entrezgene_id %in% entrez.id[i])
+  k <- which(df.g$entrezgene_id %in% entrez.id[i])
+  
+  if (length(k) == 0)
+    next
+  
+  if (length(unique(df.g$deg.a[k]))>1 | length(unique(df.g$deg.c[k]))>1 | length(unique(df.g$deg[k]))>1)
+    stop("say whaaaaaaaaaaa-")
+  
+  # Copy over the DEG labels.
+  df.cdna$deg.a[j] <- unique(df.g$deg.a[k])[1]
+  df.cdna$deg.c[j] <- unique(df.g$deg.c[k])[1]
+  df.cdna$deg[j]   <- unique(df.g$deg[k]  )[1]
+  
+  # If there's even one ARE associated with this Entrez ID (not cDNA sequence).
+  if (sum(df.g$ared[k]=="With ARE") > 0)
+    df.cdna$ared[j]  <- TRUE
+  
+  df.cdna[j, "sorted"]  <- TRUE
+  df.cdna[j, "matched"] <- TRUE
+  
+}
+
+df.cdna <- df.cdna[df.cdna$matched, ]
+df.cdna <- df.cdna[, -which(colnames(df.cdna) %in% c("sorted", "matched"))]
+
+
+df.cdna$deg.a <- levels(df.g$deg.a)[df.cdna$deg.a]
+df.cdna$deg.c <- levels(df.g$deg.c)[df.cdna$deg.c]
+df.cdna$deg   <- levels(df.g$deg  )[df.cdna$deg]
+
+df.cdna$deg.a <- factor(df.cdna$deg.a, levels(df.g$deg.a))
+df.cdna$deg.c <- factor(df.cdna$deg.c, levels(df.g$deg.c))
+df.cdna$deg   <- factor(df.cdna$deg,   levels(df.g$deg))
+
+df.cdna[df.cdna$ared==TRUE,  "ared"] <- "With ARE"
+df.cdna[df.cdna$ared==FALSE, "ared"] <- "Without ARE"
+df.cdna$ared <- factor(df.cdna$ared, levels(df.g$ared))
+
+
+# Re-ordering the dataframe for relevant-variable clartiy.
+for (c in c("number.of.sequences", "sequence", "upreg.a", "upreg.c", 
+            "downreg.a", "downreg.c", "static.a", "static.c"))
+{
+  idx <- which(colnames(df.cdna) %in% c)
+  t       <- df.cdna[,  idx]
+  df.cdna <- df.cdna[, -idx]
+  df.cdna[, c] <- t
+}
+
+
+df.cdna
+
+```
+
+
+## graph globalisation
+
+```{r}
+# Set universal shortcuts for graph visualisation.
+
+
+# Theme customisation.
+theme.global <- theme(#axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+                      #axis.title.x=element_blank(),
+                      legend.title=element_blank(),
+                      legend.position = "top", 
+                      plot.title = element_text(hjust = 0.5),
+                      plot.subtitle = element_text(hjust = 0.5))
+
+amc <- c("#A16928FF", "#BD925AFF", "#D6BD8DFF",
+         "#D0587EFF", "#D98994FF", "#E5B9ADFF",
+         "#3D5941FF", "#778868FF", "#B5B991FF")
+
+colour.amc <- scale_fill_manual(values=amc, drop = FALSE)
+
+colour.gf.utr <- scale_fill_manual(values=paletteer_d("RColorBrewer::Paired")[c(2,1,  4,3, 6,5)])
+# colour.bm.gcp <- scale_fill_manual(values=paletteer_d("DresdenColor::paired")[c(9,10 ,7,8, 1,2)])
+# colour.bm.utr <- scale_fill_manual(values=paletteer_d("colorBlindness::PairedColor12Steps")[c(8,7 ,6,5, 12,11)])
+colour.bm.utr <- scale_fill_manual(values=c("#51bef5", "#b4e7f3", "#62e641", "#c0fca2", "#e54357", "#f9b6cf"))
+colour.bm.gcp <- scale_fill_manual(values=c("#5e71de", "#abb3e1", "#54b433", "#80cf64", "#c03257", "#dd8399"))
+
+# Set the columns for which UTR entries we are examining.
+
+utr.remove <- "3'UTR_N"
+utr.choice <- "3'UTR_max"
+
+df.config     <- paste0(" [", utr.choice, "||", utr.remove, "].png")
+df.config.tab <- paste0(" [", utr.choice, "||", utr.remove, "].csv")
+
+
+# Save booleans for whether to save the figures and tables respectively.
+save.fig   <- TRUE
+save.table <- TRUE
+show.fig   <- FALSE # for visualising the plots that were explored but not formally used
+
+```
+
+
+
+
+# E0 FOR PAPER
+
+## full gene-regulation
+
+
+```{r}
+# On the full data.
+
+df.t <- df.full
+
+# Graph stuff.
+df.t$n <- NA
+for (i in names(table(df.t$deg)))
+  df.t[df.t$deg==i, "n"] <- sum(df.t$deg==i)
+df.t$n2 <- (df.t$n/320)
+df.t$n3  <- paste0(round(df.t$n*100/nrow(df.t), 1), "%")
+df.t[df.t$deg==names(table(df.t$deg))[3], "n2"] <- df.t$n2[df.t$deg==names(table(df.t$deg))[3]] + 1
+df.t[df.t$deg==names(table(df.t$deg))[7], "n2"] <- df.t$n2[df.t$deg==names(table(df.t$deg))[7]] + 1
+df.t[df.t$deg==names(table(df.t$deg))[5], "n2"] <- df.t$n2[df.t$deg==names(table(df.t$deg))[5]] / 3.45
+
+
+# Confusing bar chart of frequencies.
+if (save.fig) png(paste0(path.f, "/E0 Gene-Regulation frequencies (full)", df.config),
+                 width = 7, height = 4.35, units = 'in', res = 400)
+print(ggplot(df.t, aes(x=deg, y=1, fill=deg)) + 
+      colour.amc + scale_color_manual(values=amc) +
+      geom_bar(stat = "identity") + geom_text(aes(label=n3, color=deg), vjust = -df.t$n2) + 
+      coord_cartesian(ylim = c(0, 26500)) +
+      labs(title="Proportions of Differential Gene-expression for Both Processes",
+           x="Gene-regulation Combinations", y="Frequency") +
+      theme.global +
+      theme(#axis.title.x=element_blank(),
+            axis.text.x=element_blank()) + 
+      guides(fill=guide_legend(nrow = 3, byrow = FALSE))  )
+if (save.fig) dev.off()
+
+# tab.t <- table.to.data.frame(df.t, c("deg"), 2)
+# if (save.table) write.table(tab.t, paste0(path.n, "/E0-A Gene-Regulation FULL table of frequencies", df.config.tab), sep=",")
+
+tab.ta <- table.to.data.frame(df.t, c("deg.a"), 1)
+tab.tb <- table.to.data.frame(df.t, c("deg.c"), 1)
+
+tab.super <- cbind(tab.ta, tab.tb)
+colnames(tab.super)    <- tab.super[1, ]
+tab.super <- tab.super[-(nrow(tab.super)-1), ]
+rownames(tab.super)[nrow(tab.super)] <- "Full"
+
+rm(df.t, tab.ta, tab.tb)
+
+```
+
+## GenomicFeatures
+
+```{r}
+# Modifying df.g to plot the apoptosis and CICD results with gene-regulation labels.
+
+df.t <- df.g[dup_feature(df.g, utr.remove), ]
+df.t$utr <- as.numeric(as.character(df.t$`3'UTR_max`))
+df.t <- data.frame(utr=(c(df.t[, c(utr.choice)],  df.t[, c(utr.choice)])), 
+                        deg=   c(df.t[, c("deg.a")], df.t[, c("deg.c")]),
+                        deg.a= c(df.t[, c("deg.a")], df.t[, c("deg.a")]),
+                        deg.c= c(df.t[, c("deg.c")], df.t[, c("deg.c")]),
+                        ared=c(df.t[, c("ared")],  df.t[, c("ared")]))
+df.t$deg <- factor(df.t$deg, deg.factors.2)
+
+
+df.gtwo <- df.t
+rm(df.t)
+
+if (show.fig) df.gtwo
+
+```
+
+```{r}
+# Without AREs.
+
+df.gtwo$nothing <- "Hypothesis"
+plot1 <- ( ggplot(df.gtwo, aes(x=utr, fill=deg)) +
+        colour.gf.utr +
+        geom_histogram(bins=100) +
+        coord_cartesian(xlim = quantile(df.gtwo$utr, c(0.05, 0.99), na.rm=TRUE)) +
+        labs(#title="Distribution of UTR Lengths",
+             x="3'UTR Length (nt)", y="Frequency") +
+        theme.global +
+        guides(fill=guide_legend(nrow = 2, byrow = FALSE))
+       )
+df.gtwo$nothing <- "Type of Method"
+plot2 <- (ggplot(df.gtwo, aes(x=deg, y=utr, fill=deg)) +
+        colour.gf.utr +
+        # geom_violin(alpha=0.25) + 
+        geom_boxplot(outlier.color=NA) +
+        coord_cartesian(ylim = quantile(df.gtwo$utr, c(0.05, 0.99), na.rm=TRUE)) +
+        labs(#title="Spread of 3'UTR Lengths",
+             x="Gene-regulation and Cell Death Group", y="3'UTR Length (nt)") +
+        theme.global +
+        theme(#axis.title.x=element_blank(),
+              axis.text.x=element_blank(),
+              #axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+              legend.text = element_text(size=8),
+              legend.box.margin=margin(0, 35, 0, 0)) +
+        # guides(fill=guide_legend(nrow = 2, byrow = FALSE))
+        guides(fill="none")
+       )
+
+  
+if (save.fig) png(paste0(path.f, "/E1 GenomicFeatures UTR lengths", df.config), 
+                 width = 7, height = 4.35, units = 'in', res = 400)
+guide_area() + (plot1 + plot2) +
+  plot_layout(guides = "collect", nrow = 2, heights = c(1,8)) +
+  plot_annotation("Distribution and Spread of 3'UTR Lengths (GenomicFeatures)") &
+  theme(legend.position = "top",
+        legend.box.margin=margin(0, 30, 5, 0),
+        plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+if (save.fig) dev.off()
+
+rm(plot1, plot2)
+```
+
+```{r}
+# With AREs.
+
+df.gtwo$nothing <- "Hypothesis"
+plot1 <- ( ggplot(df.gtwo, aes(x=utr, fill=ared)) +
+        # colour.gf.utr +
+        geom_histogram(bins=100) +
+        coord_cartesian(xlim = quantile(df.gtwo$utr, c(0.05, 0.99), na.rm=TRUE)) +
+         labs(#title="Distribution of UTR Lengths",
+             x="3'UTR Length (nt)", y="Frequency") +
+        theme.global +
+        guides(fill=guide_legend(nrow = 1, byrow = FALSE))
+       )
+df.gtwo$nothing <- "Type of Method"
+plot2 <- (ggplot(df.gtwo, aes(x=ared, y=utr, fill=deg)) +
+        colour.gf.utr +
+        # geom_violin(alpha=0.25) + 
+        geom_boxplot(outlier.color=NA) +
+        coord_cartesian(ylim = quantile(df.gtwo$utr, c(0.05, 0.99), na.rm=TRUE)) +
+        labs(#title="Spread of 3'UTR Lengths",
+             x="Gene-regulation and Cell Death Group", y="3'UTR Length (nt)") +
+        theme.global +
+        theme(#axis.title.x=element_blank(),
+              #axis.text.x=element_blank(),
+              #axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+              legend.text = element_text(size=8),
+              legend.box.margin=margin(0, 35, 0, 0)) +
+        guides(fill=guide_legend(nrow = 2, byrow = FALSE))
+        # guides(fill="none")
+       )
+
+  
+if (save.fig) png(paste0(path.f, "/E1 GenomicFeatures UTR lengths with AREs", df.config), 
+                 width = 7, height = 4.35, units = 'in', res = 400)
+guide_area() + (plot1 + plot2) +
+  plot_layout(guides = "keep", nrow = 2, heights = c(-1.2,10)) +
+  plot_annotation("Distribution and Spread of 3'UTR Lengths (GenomicFeatures)") &
+  theme(legend.position = "top",
+        #legend.box.margin=margin(0, 30, 5, 0),
+        plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+if (save.fig) dev.off()
+
+rm(plot1, plot2)
+```
+
+```{r}
+
+tab.ta <- table.to.data.frame(df.gtwo, c("deg.a"), 1)
+tab.tb <- table.to.data.frame(df.gtwo, c("deg.c"), 1)
+tab.t  <- cbind(tab.ta, tab.tb)
+tab.super  <- rbind(tab.super, setNames(tab.t, names(tab.super)) )
+tab.super <- tab.super[-(nrow(tab.super)-1), ]
+rownames(tab.super)[nrow(tab.super)] <- "\textit{GF}"
+
+tab.ta <- table.to.data.frame(df.gtwo[df.gtwo$ared=="With ARE", ], c("deg.a"), 1)
+tab.tb <- table.to.data.frame(df.gtwo[df.gtwo$ared=="With ARE", ], c("deg.c"), 1)
+tab.t  <- cbind(tab.ta, tab.tb)
+tab.super  <- rbind(tab.super, setNames(tab.t, names(tab.super)) )
+tab.super <- tab.super[-(nrow(tab.super)-1), ]
+rownames(tab.super)[nrow(tab.super)] <- "\textit{GF} ARE"
+
+rm(tab.ta, tab.tb, tab.t)
+
+```
+
+
+
+## biomaRt: exploring
+
+```{r}
+# Modifying df.g to plot the apoptosis and CICD results with gene-regulation labels.
+
+df.t <- df.cdna
+# df.t$utr <- df.t$length
+df.t <- data.frame(utr=(c(df.t[, c("length")],  df.t[, c("length")])),
+                         gc= c(df.t[,c("gc.prop")],df.t[, c("gc.prop")]),
+                        deg=   c(df.t[, c("deg.a")], df.t[, c("deg.c")]),
+                        deg.a= c(df.t[, c("deg.a")], df.t[, c("deg.a")]),
+                        deg.c= c(df.t[, c("deg.c")], df.t[, c("deg.c")]),
+                        ared=c(df.t[, c("ared")],  df.t[, c("ared")]),
+                   nos=c(df.t[, c("number.of.sequences")],  df.t[, c("number.of.sequences")]))
+df.t$deg <- factor(df.t$deg, deg.factors.2)
+
+
+df.ctwo <- df.t
+rm(df.t)
+
+if (show.fig) df.ctwo
+
+```
+
+```{r warning=FALSE}
+
+df.t <- data.frame(utr=c(df.cdna$length, df.cdna$gc.count),
+                   type=c(rep("UTR Sequence Length",              nrow(df.cdna)), 
+                          rep("Amount of GC Nucleotides Present", nrow(df.cdna))))
+
+if (save.fig) png(paste0(path.f, "/E2 gc and seq.length occurances", df.config),
+                 width = 7, height = 4.35, units = 'in', res = 400)
+print(ggplot(df.t, aes(x=utr, fill=type)) + 
+        geom_histogram(bins=80, alpha=0.6, position="identity") + #facet_wrap(~ared, scale="free") +
+        labs(title="Comparing the Distribution of 3'UTR Lengths and GC Nucleotide Counts",
+             x="3'UTR Sequence Length", y="Frequency") +
+        theme.global 
+  )
+if (save.fig) dev.off()
+rm(df.t)
+
+
+# Significance tests.
+if (as.numeric(ks.test(df.cdna$length, df.cdna$gc.count)$p.value) < alpha)
+  print("The sequence lengths and GC counts come from different disrtibutions.")
+if (as.numeric(wilcox.test(df.cdna$length, df.cdna$gc.count)$p.value) < alpha)
+  print("Their distributions have different medians")
+if ((as.numeric(shapiro.test(df.cdna$length)$p.value) < alpha) & 
+    (as.numeric(shapiro.test(df.cdna$gc.count)$p.value) < alpha))
+  print("Neither distribution is normal.")
+
+```
+
+
+## biomaRt: features
+
+```{r}
+# UTR lengths without AREs.
+
+df.ctwo$nothing <- "Hypothesis"
+plot1 <- ( ggplot(df.ctwo, aes(x=utr, fill=deg)) +
+        colour.bm.utr +
+        (geom_histogram)(bins=100) +
+        coord_cartesian(xlim = quantile(df.ctwo$utr, c(0.05, 0.99), na.rm=TRUE)) +
+        labs(#title="Distribution of UTR Lengths",
+             x="3'UTR Length (nt)", y="Frequency") +
+        theme.global +
+        guides(fill=guide_legend(nrow = 2, byrow = FALSE))
+       )
+df.ctwo$nothing <- "Type of Method"
+plot2 <- ( ggplot(df.ctwo, aes(x=deg, y=utr, fill=deg)) +
+        colour.bm.utr +
+        # geom_violin(alpha=0.25) + 
+        geom_boxplot(outlier.color=NA) +
+        coord_cartesian(ylim = quantile(df.ctwo$utr, c(0.05, 0.99), na.rm=TRUE)) +
+        labs(#title="Spread of 3'UTR Lengths",
+             x="Gene-regulation and Cell Death Group", y="3'UTR Length (nt)") +
+        theme.global +
+        theme(#axis.title.x=element_blank(),
+              #axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+              axis.text.x=element_blank(),
+              legend.text = element_text(size=8),
+              legend.box.margin=margin(0, 35, 0, 0)) +
+        #guides(fill=guide_legend(nrow = 2, byrow = FALSE))
+        guides(fill="none")
+       )
+
+  
+if (save.fig) png(paste0(path.f, "/E3 biomaRt UTR lengths", df.config), 
+                 width = 7, height = 4.35, units = 'in', res = 400)
+guide_area() + (plot1 + plot2) +
+  plot_layout(guides = "collect", nrow = 2, heights = c(1,8)) +
+  plot_annotation("Distribution and Spread of 3'UTR Lengths (biomaRt)") &
+  theme(legend.position = "top",
+        legend.box.margin=margin(0, 30, 5, 0),
+        plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+if (save.fig) dev.off()
+
+rm(plot1, plot2)
+```
+
+```{r}
+if (save.fig) png(paste0(path.f, "/E2 seq.count frequencies", df.config),
+                 width = 7, height = 4.35, units = 'in', res = 400)
+print(ggplot(df.ctwo, aes(x=nos, fill=deg)) +#, fill=deg)) +
+        colour.gf.utr +
+        geom_histogram() +
+        labs(title="Distribution of the Many-to-One Mapping of the 3'UTR Sequences",
+             x="Number of Sequences per EntrezID", y="Frequency") +
+        theme.global
+  )
+if (save.fig) dev.off()
+```
+
+```{r}
+# UTR lengths with AREs.
+
+df.ctwo$nothing <- "Hypothesis"
+plot1 <- ( ggplot(df.ctwo, aes(x=utr, fill=ared)) +
+        # colour.bm.utr +
+        geom_histogram(bins=100) +
+        coord_cartesian(xlim = quantile(df.ctwo$utr, c(0.05, 0.99), na.rm=TRUE)) +
+        labs(#title="Distribution of UTR Lengths",
+             x="3'UTR Length (nt)", y="Frequency") +
+        theme.global +
+        guides(fill=guide_legend(nrow = 1, byrow = FALSE))
+       )
+df.ctwo$nothing <- "Type of Method"
+plot2 <- ( ggplot(df.ctwo, aes(x=ared, y=utr, fill=deg)) +
+        colour.bm.utr +
+        # geom_violin(alpha=0.25) + 
+        geom_boxplot(outlier.color=NA) +
+        coord_cartesian(ylim = quantile(df.ctwo$utr, c(0.05, 0.99), na.rm=TRUE)) +
+        labs(#title="Spread of 3'UTR Lengths",
+             x="Gene-regulation and Cell Death Group", y="3'UTR Length (nt)") +
+        theme.global +
+        theme(#axis.title.x=element_blank(),
+              #axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+              #axis.text.x=element_blank(),
+              legend.text = element_text(size=8),
+              legend.box.margin=margin(0, 35, 0, 0)) +
+        guides(fill=guide_legend(nrow = 2, byrow = FALSE))
+       )
+
+  
+if (save.fig) png(paste0(path.f, "/E3 biomaRt UTR lengths with AREs", df.config), 
+                 width = 7, height = 4.35, units = 'in', res = 400)
+guide_area() + (plot1 + plot2) +
+  plot_layout(guides = "keep", nrow = 2, heights = c(-1.2,10)) +
+  plot_annotation("Distribution and Spread of 3'UTR Lengths (biomaRt)") &
+  theme(legend.position = "top",
+        legend.box.margin=margin(0, 30, 5, 0),
+        plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+if (save.fig) dev.off()
+
+rm(plot1, plot2)
+```
+
+```{r}
+# GC proportions without AREs.
+
+df.ctwo$nothing <- "Hypothesis"
+plot1 <- ( ggplot(df.ctwo, aes(x=gc, fill=deg)) +
+        colour.bm.gcp +
+        geom_histogram(bins=100) +
+        coord_cartesian(xlim = quantile(df.ctwo$gc, c(0.01, 0.99), na.rm=TRUE)) +
+        labs(#title="Distribution of UTR Lengths",
+             x="GC Proportion (%)", y="Frequency") +
+        theme.global +
+        guides(fill=guide_legend(nrow = 2, byrow = FALSE))
+       )
+df.ctwo$nothing <- "Type of Method"
+plot2 <- ( ggplot(df.ctwo, aes(x=deg, y=gc, fill=deg)) +
+        colour.bm.gcp +
+        # geom_violin(alpha=0.25) + 
+        geom_boxplot(outlier.color=NA) +
+        coord_cartesian(ylim = c(0,1)) +
+        labs(#title="Spread of 3'UTR Lengths",
+             x="Gene-regulation and Cell Death Group", y="GC Proportion (%)") +
+        theme.global +
+        theme(#axis.title.x=element_blank(),
+              #axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+              axis.text.x=element_blank(),
+              legend.text = element_text(size=8),
+              legend.box.margin=margin(0, 35, 0, 0)) +
+        #guides(fill=guide_legend(nrow = 2, byrow = FALSE))
+        guides(fill="none")
+       )
+
+  
+if (save.fig) png(paste0(path.f, "/E3 biomaRt GC proportions", df.config), 
+                 width = 7, height = 4.35, units = 'in', res = 400)
+guide_area() + (plot1 + plot2) +
+  plot_layout(guides = "collect", nrow = 2, heights = c(1,8)) +
+  plot_annotation("Distribution and Spread of GC Proportions (biomaRt)") &
+  theme(legend.position = "top",
+        legend.box.margin=margin(0, 30, 5, 0),
+        plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+if (save.fig) dev.off()
+
+rm(plot1, plot2)
+```
+
+
+```{r}
+# GC proportions with AREs.
+
+df.cdna$nothing <- "Hypothesis"
+plot1 <- ( ggplot(df.cdna, aes(x=gc.prop, fill=ared)) +#, fill=deg)) +
+        # colour.amc + 
+        # colour.bm.gcp +
+        geom_histogram(bins=50) + #facet_wrap(~ared, scale="free") +
+        coord_cartesian(xlim = quantile(df.cdna$gc.prop, c(0.01, 0.99), na.rm=TRUE)) +
+        labs(#title="Distribution of UTR Lengths",
+             x="GC Proportion (%)", y="Frequency") +
+        theme.global +
+        guides(fill=guide_legend(nrow = 1, byrow = FALSE))
+       )
+df.ctwo$nothing <- "Type of Method"
+plot2 <- ( ggplot(df.ctwo, aes(x=ared, y=gc, fill=deg)) +
+        colour.bm.gcp +
+        # geom_violin(alpha=0.25) + 
+        geom_boxplot(outlier.color=NA) +
+        coord_cartesian(ylim = c(0,1)) +
+        labs(#title="Spread of 3'UTR Lengths",
+             x="Gene-regulation and Cell Death Group", y="GC Proportion (%)") +
+        theme.global +
+        theme(#axis.title.x=element_blank(),
+              #axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+              #axis.text.x=element_blank(),
+              legend.text = element_text(size=8),
+              legend.box.margin=margin(0, 35, 0, 0)) +
+        guides(fill=guide_legend(nrow = 2, byrow = FALSE))
+       )
+
+  
+if (save.fig) png(paste0(path.f, "/E3 biomaRt GC proportions with AREs", df.config), 
+                 width = 7, height = 4.35, units = 'in', res = 400)
+guide_area() + (plot1 + plot2) +
+  plot_layout(guides = "keep", nrow = 2, heights = c(-1.2,10)) +
+  plot_annotation("Distribution and Spread of GC Proportions (biomaRt)") &
+  theme(legend.position = "top",
+        legend.box.margin=margin(0, 30, 5, 0),
+        plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+if (save.fig) dev.off()
+
+rm(plot1, plot2)
+```
+
+```{r}
+
+tab.ta <- table.to.data.frame(df.cdna, c("deg.a"), 1)
+tab.tb <- table.to.data.frame(df.cdna, c("deg.c"), 1)
+tab.t  <- cbind(tab.ta, tab.tb)
+tab.super  <- rbind(tab.super, setNames(tab.t, names(tab.super)) )
+tab.super <- tab.super[-(nrow(tab.super)-1), ]
+rownames(tab.super)[nrow(tab.super)] <- "\textit{biomaRt}"
+
+tab.ta <- table.to.data.frame(df.ctwo[df.ctwo$ared=="With ARE", ], c("deg.a"), 1)
+tab.tb <- table.to.data.frame(df.ctwo[df.ctwo$ared=="With ARE", ], c("deg.c"), 1)
+tab.t  <- cbind(tab.ta, tab.tb)
+tab.super  <- rbind(tab.super, setNames(tab.t, names(tab.super)) )
+tab.super <- tab.super[-(nrow(tab.super)-1), ]
+rownames(tab.super)[nrow(tab.super)] <- "\textit{biomaRt} ARE"
+
+rm(tab.ta, tab.tb, tab.t)
+
+```
+
+
+
+
+# E0 Significances
+
+```{r}
+# Table exporting
+if (save.table) write.table(tab.super,
+                            paste0(path.n, "/Table of Gene-Regulation Frequencies", df.config.tab), sep=",")
+```
+
+```{r}
+tab.super
+```
+
+
+## GenomicFeatures
+
+```{r warning=FALSE}
+# Generate all the statistics between all the gene-regulation and ared combinations.
+
+stat.res.g <- data.frame(x=NA, y=NA, feature=NA, ared.x=NA, ared.y=NA, 
+                       same.distr=NA, same.median=NA, is.x.normal=NA, is.y.normal=NA, same.mean=NA, 
+                       n.x=NA, n.y=NA)
+stat.res.g <- rbind(stat.res.g, setNames(stat.tests(df.gtwo, "", "", "utr"), names(stat.res.g))) 
+
+for (i in 1:length(levels(df.gtwo$deg)))
+  for (j in i:length(levels(df.gtwo$deg)))
+    stat.res.g <- rbind(stat.res.g, setNames(stat.tests(df.gtwo, levels(df.gtwo$deg)[i], 
+                                                             levels(df.gtwo$deg)[j], "utr"), names(stat.res.g)))
+
+# Set feature types.
+stat.res.g <- stat.res.g[-1, ]
+rownames(stat.res.g) <- NULL
+stat.res.g$x      <- factor(stat.res.g$x, c(levels(df.gtwo$deg), ""))
+stat.res.g$y      <- factor(stat.res.g$y, c(levels(df.gtwo$deg), ""))
+stat.res.g$n.x    <- as.numeric(stat.res.g$n.x)
+stat.res.g$n.y    <- as.numeric(stat.res.g$n.y)
+stat.res.g$feature <- factor(stat.res.g$feature)
+stat.res.g$ared.x  <- factor(stat.res.g$ared.x)
+stat.res.g$ared.y  <- factor(stat.res.g$ared.y)
+
+for (c in which(colnames(stat.res.g) %in% c("same.distr", "same.median", "is.x.normal", "is.y.normal", "same.mean")))
+  stat.res.g[, c]  <- as.logical(stat.res.g[, c])
+stat.res.g$same.mean <- (stat.res.g$same.mean & stat.res.g$is.x.normal & stat.res.g$is.y.normal)
+
+stat.res.g
+
+```
+
+```{r}
+
+print("FOR THE UTR ANALYSIS::")
+print(paste0("The amount of combinations that have the same distribution are: ", 
+             round(sum(stat.res.g$same.distr*100/nrow(stat.res.g)), 2), "%"))
+print(paste0("The amount of combinations that have the same median is: ", 
+             round(sum(stat.res.g$same.median)*100/nrow(stat.res.g), 2), "%"))
+print(paste0("The amount of normal distributions are ", round(sum(stat.res.g$is.x.normal)*100/nrow(stat.res.g), 2), "% and ", round(sum(stat.res.g$is.y.normal)*100/nrow(stat.res.g), 2), "% (x and y, respectively)"))
+
+```
+
+```{r}
+
+# splitting by ARE causes a different distribution
+stat.res.g[stat.res.g$x==stat.res.g$y, ] 
+stat.res.g[stat.res.g$ared.x!=stat.res.g$ared.y, ]
+stat.res.g[stat.res.g$ared.x==stat.res.g$ared.y, -c(3)]
+stat.res.g[(stat.res.g$ared.x==stat.res.g$ared.y) & (stat.res.g$ared.x==""), -c(3)]
+stat.res.g[(stat.res.g$ared.x==stat.res.g$ared.y) & (stat.res.g$ared.x=="With ARE"), -c(3)]
+stat.res.g[(stat.res.g$ared.x==stat.res.g$ared.y) & (stat.res.g$ared.x=="Without ARE"), -c(3)]
+stat.res.g[rowSums(sapply(stat.res.g[, c(6, 7, 10)], as.numeric)) %in% c(0), ]
+
+# the wilcox test is applicable to static apop and static cicd against up_reg apop,
+# their means differ
+stat.res.g[rowSums(sapply(stat.res.g[, c(6, 7, 10)], as.numeric)) %in% c(1), ]
+
+# static cicd and up_reg cicd have the same distribution
+stat.res.g[rowSums(sapply(stat.res.g[, c(6, 7, 10)], as.numeric)) %in% c(2), ]
+
+```
+
+
+
+## biomaRt
+
+```{r warning=FALSE}
+# Generate all the statistics between all the gene-regulation and ared combinations.
+df.t <- list()
+
+for (f.val in c("utr", "gc", "nos"))
+{
+  stat.res.c <- data.frame(x=NA, y=NA, feature=NA, ared.x=NA, ared.y=NA, 
+                         same.distr=NA, same.median=NA, is.x.normal=NA, is.y.normal=NA, same.mean=NA, 
+                         n.x=NA, n.y=NA)
+  stat.res.c <- rbind(stat.res.c, setNames(stat.tests(df.ctwo, "", "", f.val), names(stat.res.c))) 
+  
+  for (i in 1:length(levels(df.ctwo$deg)))
+    for (j in i:length(levels(df.ctwo$deg)))
+      stat.res.c <- rbind(stat.res.c, setNames(stat.tests(df.ctwo, levels(df.ctwo$deg)[i], 
+                                                               levels(df.ctwo$deg)[j], f.val), names(stat.res.c)))
+  
+  # Set feature types.
+  stat.res.c <- stat.res.c[-1, ]
+  rownames(stat.res.c) <- NULL
+  stat.res.c$x      <- factor(stat.res.c$x, c(levels(df.ctwo$deg), ""))
+  stat.res.c$y      <- factor(stat.res.c$y, c(levels(df.ctwo$deg), ""))
+  stat.res.c$n.x    <- as.numeric(stat.res.c$n.x)
+  stat.res.c$n.y    <- as.numeric(stat.res.c$n.y)
+  stat.res.c$feature <- factor(stat.res.c$feature)
+  stat.res.c$ared.x  <- factor(stat.res.c$ared.x)
+  stat.res.c$ared.y  <- factor(stat.res.c$ared.y)
+  
+  for (c in which(colnames(stat.res.c) %in% c("same.distr", "same.median", "is.x.normal", "is.y.normal", "same.mean")))
+    stat.res.c[, c]  <- as.logical(stat.res.c[, c])
+  stat.res.c$same.mean <- (stat.res.c$same.mean & stat.res.c$is.x.normal & stat.res.c$is.y.normal)
+  
+  df.t[[length(df.t)+1]] <- stat.res.c
+}
+
+stat.res.c.utr <- df.t[[1]]
+stat.res.c.gc  <- df.t[[2]]
+stat.res.c.nos <- df.t[[3]]
+rm(df.t, stat.res.c)
+
+stat.res.c.utr
+stat.res.c.gc
+stat.res.c.nos
+
+```
+
+
+```{r}
+
+print("FOR THE UTR ANALYSIS::")
+print(paste0("The amount of combinations that have the same distribution are: ", 
+             round(sum(stat.res.c.utr$same.distr*100/nrow(stat.res.c.utr)), 2), "%"))
+print(paste0("The amount of combinations that have the same median is: ", 
+             round(sum(stat.res.c.utr$same.median)*100/nrow(stat.res.c.utr), 2), "%"))
+print(paste0("The amount of normal distributions are ", round(sum(stat.res.c.utr$is.x.normal)*100/nrow(stat.res.c.utr), 2), "% and ", round(sum(stat.res.c.utr$is.y.normal)*100/nrow(stat.res.c.utr), 2), "% (x and y, respectively)"))
+
+```
+
+
+```{r}
+
+# splitting by ARE causes a different distribution
+stat.res.c.utr[stat.res.c.utr$x==stat.res.c.utr$y, ] 
+stat.res.c.utr[stat.res.c.utr$ared.x!=stat.res.c.utr$ared.y, ]
+stat.res.c.utr[stat.res.c.utr$ared.x==stat.res.c.utr$ared.y, -c(3)]
+stat.res.c.utr[(stat.res.c.utr$ared.x==stat.res.c.utr$ared.y) & (stat.res.c.utr$ared.x==""), -c(3)]
+stat.res.c.utr[(stat.res.c.utr$ared.x==stat.res.c.utr$ared.y) & (stat.res.c.utr$ared.x=="With ARE"), -c(3)]
+stat.res.c.utr[(stat.res.c.utr$ared.x==stat.res.c.utr$ared.y) & (stat.res.c.utr$ared.x=="Without ARE"), -c(3)]
+stat.res.c.utr[rowSums(sapply(stat.res.c.utr[, c(6, 7, 10)], as.numeric)) %in% c(0), ]
+
+# the wilcox test is applicable to static apop and static cicd against up_reg apop,
+# their means differ
+stat.res.c.utr[rowSums(sapply(stat.res.c.utr[, c(6, 7, 10)], as.numeric)) %in% c(1), ]
+
+# static cicd and up_reg cicd have the same distribution
+stat.res.c.utr[rowSums(sapply(stat.res.c.utr[, c(6, 7, 10)], as.numeric)) %in% c(2), ]
+
+```
+
+
+```{r}
+
+print("FOR THE GC ANALYSIS::")
+print(paste0("The amount of combinations that have the same distribution are: ", 
+             round(sum(stat.res.c.gc$same.distr*100/nrow(stat.res.c.gc)), 2), "%"))
+print(paste0("The amount of combinations that have the same median is: ", 
+             round(sum(stat.res.c.gc$same.median)*100/nrow(stat.res.c.gc), 2), "%"))
+print(paste0("The amount of normal distributions are ", round(sum(stat.res.c.gc$is.x.normal)*100/nrow(stat.res.c.gc), 2), "% and ", round(sum(stat.res.c.gc$is.y.normal)*100/nrow(stat.res.c.gc), 2), "% (x and y, respectively)"))
+
+```
+
+
+
+```{r}
+
+# splitting by ARE causes a different distribution except in down_reg apoptosis
+stat.res.c.gc[stat.res.c.gc$x==stat.res.c.gc$y, ] 
+
+# comparing the distributions, they're normally the same other than up-reg CICD and down-reg apoptosis
+stat.res.c.gc[stat.res.c.gc$ared.x==stat.res.c.gc$ared.y, -c(3,5,8,9)]
+stat.res.g[(stat.res.g$ared.x==stat.res.g$ared.y) & (stat.res.g$ared.x==""), -c(3)]
+stat.res.g[(stat.res.g$ared.x==stat.res.g$ared.y) & (stat.res.g$ared.x=="With ARE"), -c(3)]
+stat.res.g[(stat.res.g$ared.x==stat.res.g$ared.y) & (stat.res.g$ared.x=="Without ARE"), -c(3)]
+
+
+# when comparing the impact of are stratification
+stat.res.c.gc[stat.res.c.gc$ared.x!=stat.res.c.gc$ared.y, ]
+
+# those that definitely varied (up-reg CICD and down-reg apoptosis)
+stat.res.c.gc[rowSums(sapply(stat.res.c.gc[, c(6, 7, 10)], as.numeric)) %in% c(0), ]
+
+# static cicd and up_reg cicd have the same distribution?
+stat.res.c.gc[rowSums(sapply(stat.res.c.gc[, c(6, 7, 10)], as.numeric)) %in% c(2), ]
+
+# results where both subgroups were normal.
+stat.res.c.gc[rowSums(sapply(stat.res.c.gc[, c(8, 9)], as.numeric)) %in% c(1), ]
+stat.res.c.gc[rowSums(sapply(stat.res.c.gc[, c(8, 9)], as.numeric)) %in% c(2), ]
+
+```
+
+```{r}
+
+print("FOR THE UTR ANALYSIS::")
+print(paste0("The amount of combinations that have the same distribution are: ", 
+             round(sum(stat.res.c.nos$same.distr*100/nrow(stat.res.c.nos)), 2), "%"))
+print(paste0("The amount of combinations that have the same median is: ", 
+             round(sum(stat.res.c.nos$same.median)*100/nrow(stat.res.c.nos), 2), "%"))
+print(paste0("The amount of normal distributions are ", round(sum(stat.res.c.nos$is.x.normal)*100/nrow(stat.res.c.nos), 2), "% and ", round(sum(stat.res.c.nos$is.y.normal)*100/nrow(stat.res.c.nos), 2), "% (x and y, respectively)"))
+
+```
+
+
+```{r}
+
+# splitting by ARE causes a different distribution
+stat.res.c.nos[stat.res.c.nos$x==stat.res.c.nos$y, ] 
+stat.res.c.nos[stat.res.c.nos$ared.x!=stat.res.c.nos$ared.y, ]
+stat.res.c.nos[stat.res.c.nos$ared.x==stat.res.c.nos$ared.y, -c(3)]
+stat.res.c.nos[(stat.res.c.nos$ared.x==stat.res.c.nos$ared.y) & (stat.res.c.nos$ared.x==""), -c(3)]
+stat.res.c.nos[(stat.res.c.nos$ared.x==stat.res.c.nos$ared.y) & (stat.res.c.nos$ared.x=="With ARE"), -c(3)]
+stat.res.c.nos[(stat.res.c.nos$ared.x==stat.res.c.nos$ared.y) & (stat.res.c.nos$ared.x=="Without ARE"), -c(3)]
+stat.res.c.nos[rowSums(sapply(stat.res.c.nos[, c(6, 7, 10)], as.numeric)) %in% c(0), ]
+
+# the wilcox test is applicable to static apop and static cicd against up_reg apop,
+# their means differ
+stat.res.c.nos[rowSums(sapply(stat.res.c.nos[, c(6, 7, 10)], as.numeric)) %in% c(1), ]
+
+# static cicd and up_reg cicd have the same distribution
+stat.res.c.nos[rowSums(sapply(stat.res.c.nos[, c(6, 7, 10)], as.numeric)) %in% c(2), ]
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+
+#save.fig   <- FALSE
+# save.table <- FALSE
+
+stop("I don't want to run the later code.")
+
+```
+
+
+
+
+
+
+# E1 [df.g]
+
+how DEGs and sig.gs interact? do certain gs regulate in a certain manner due to a e.g shorter UTR (general regulation vs specific)
+
+## E1-A gene-regulation
+
+```{r}
+# df.t <- df.g[dup_feature(df.g, utr.remove), ]
+# df.t$utr <- as.numeric(as.character(df.t[ , utr.choice]))
+# 
+# df.t$n <- NA
+# for (i in names(table(df.t$deg)))
+#   df.t[df.t$deg==i, "n"] <- sum(df.t$deg==i)
+# 
+# df.t$n2 <- (df.t$n/180)
+# df.t$n3  <- paste0(round(df.t$n*100/nrow(df.t), 1), "%")
+# df.t[df.t$deg==names(table(df.t$deg))[3], "n2"] <- df.t$n2[df.t$deg==names(table(df.t$deg))[3]] + 0.5
+# df.t[df.t$deg==names(table(df.t$deg))[7], "n2"] <- df.t$n2[df.t$deg==names(table(df.t$deg))[7]] + 0.5
+# df.t[df.t$deg==names(table(df.t$deg))[5], "n2"] <- df.t$n2[df.t$deg==names(table(df.t$deg))[5]] / 1.9
+# 
+# 
+# # Confusing bar chart of frequencies.
+# if (save.fig) png(paste0(path.f, "/E1-A Gene-Regulation 1a frequencies", df.config),
+#                  width = 7, height = 4.35, units = 'in', res = 400)
+# print(ggplot(df.t, aes(x=deg, y=1, fill=deg)) + 
+#       colour.amc + scale_color_manual(values=amc) +
+#       geom_bar(stat = "identity") + geom_text(aes(label=n3, color=deg), vjust = -df.t$n2) + 
+#       coord_cartesian(ylim = c(0, 9000)) +
+#       labs(title="Frequencies of Each Gene-Regulation Combination",
+#            y="Frequency") +
+#       theme.global +
+#       theme(axis.title.x=element_blank(),
+#             axis.text.x=element_blank()) + 
+#       guides(fill=guide_legend(nrow = 3, byrow = FALSE))  )
+# if (save.fig) dev.off()
+# 
+# 
+# df.t <- df.t[df.t$deg!=names(table(df.t$deg))[5], ]
+# df.t$n2 <- (df.t$n/40) + 3
+# df.t[df.t$deg==names(table(df.t$deg))[3], "n2"] <- df.t$n2[df.t$deg==names(table(df.t$deg))[3]] - 1.5
+# df.t[df.t$deg==names(table(df.t$deg))[7], "n2"] <- df.t$n2[df.t$deg==names(table(df.t$deg))[7]] - 2.0
+# df.t[df.t$deg==names(table(df.t$deg))[4], "n2"] <- df.t$n2[df.t$deg==names(table(df.t$deg))[4]] + 1.0
+# df.t$n3  <- paste0(round(df.t$n*100/nrow(df.t), 1), "%")
+# 
+# if (save.fig) png(paste0(path.f, "/E1-A Gene-Regulation 1b frequencies", df.config),
+#                  width = 7, height = 4.35, units = 'in', res = 400)
+# print(ggplot(df.t, aes(x=deg, y=1, fill=deg)) + 
+#       colour.amc + scale_color_manual(values=amc, drop=FALSE) +
+#       # geom_bar(stat = "identity") + geom_text(aes(label=n, color=deg), vjust = -df.t$n2) + 
+#       geom_bar(stat = "identity") + geom_text(aes(label=n3, color=deg), vjust = -df.t$n2) + 
+#       coord_cartesian(ylim = c(0, 900)) +
+#       labs(# title="Frequencies of Each Gene-Regulation Combination",
+#            y="Frequency") +
+#       theme.global +
+#       theme(axis.title.x=element_blank(),
+#             axis.text.x=element_blank()) + 
+#       guides(fill=guide_legend(nrow = 3, byrow = FALSE), label="none", color="none")  )
+# if (save.fig) dev.off()
+# 
+# if (save.fig) png(paste0(path.f, "/E1-A Gene-Regulation 2 utr spread", df.config),
+#                  width = 7, height = 4.35, units = 'in', res = 400)
+# print(ggplot(df.t, aes(x=ared, y=utr, fill=deg)) +
+#         colour.amc + 
+#         geom_boxplot(outlier.color=NA) +
+#         # geom_violin () +
+#         coord_cartesian(ylim = quantile(df.t$utr, c(0.05, 0.99), na.rm=TRUE)) +
+#         labs(title="Spread of 3'UTR Lengths",
+#              y="3'UTR Length") +
+#         theme.global +
+#         theme(axis.title.x=element_blank()) +
+#         guides(fill=guide_legend(nrow = 3, byrow = FALSE))
+#   )
+# if (save.fig) dev.off()
+# 
+# tab.t <- table.to.data.frame(df.t, c("deg"), 2)
+# if (save.table) write.table(tab.t, paste0(path.n, "/E1-A Gene-Regulation table of frequencies", df.config.tab), sep=",")
+# 
+# 
+# rm(df.t, tab.t)
+
+```
+
+## E1-B gc content
+
+```{r}
+#===============
+# Hidden Figures
+#===============
+
+# ARE sequence lengths and gc proportions, very uninformative features.
+if (show.fig)
+{ 
+  df.t <- df.g[dup_feature(df.g, utr.remove), ]
+  df.t$utr <- as.numeric(as.character(df.t[ , utr.choice]))
+  
+  
+  print(ggplot(df.t, aes(x=gc.prop)) +
+          geom_histogram(bins=5)  )
+  print(ggplot(df.t, aes(x=seq.length)) +
+          geom_histogram(bins=10)  )
+  
+  print(nrow(df.t))
+  rm(df.t)
+}
+
+```
+
+```{r}
+# Frequencies of the ARE gc proportions and sequence lengths
+
+df.t  <- df.g[dup_feature(df.g, utr.remove), ]
+df.t$utr <- as.numeric(as.character(df.t[ , utr.choice]))
+
+
+tab.t <- table.to.data.frame(df.t, c("gc.prop"), 2)
+if (save.table) write.table(tab.t, paste0(path.n, "/E1-B table of gc.prop", df.config.tab), sep=",")
+
+tab.t <- table.to.data.frame(df.t, c("seq.length"), 2)
+if (save.table) write.table(tab.t, paste0(path.n, "/E1-B table of seq.length", df.config.tab), sep=",")
+
+rm(df.t, tab.t)
+
+```
+
+
+
+# E2 [df.g]
+
+## dataframe
+
+```{r}
+# Modifying df.g to plot the apoptosis and CICD results with gene-regulation labels.
+
+df.t <- df.g[dup_feature(df.g, utr.remove), ]
+df.t$utr <- as.numeric(as.character(df.t$`3'UTR_max`))
+df.t <- data.frame(utr=(c(df.t[, c(utr.choice)],  df.t[, c(utr.choice)])), 
+                        deg= c(df.t[, c("deg.a")], df.t[, c("deg.c")]),
+                        ared=c(df.t[, c("ared")],  df.t[, c("ared")]))
+
+# df.t$deg <- factor(df.t$deg, unique(df.t$deg)[c(1,4, 2,5, 3,6)])
+# df.t$deg <- factor(df.t$deg, unique(df.t$deg)[c(3,6, 1,4, 2,5)])
+
+
+df.gtwo <- df.t
+rm(df.t)
+
+if (show.fig) df.gtwo
+
+```
+
+## E2-A utr lengths
+
+```{r}
+#===============
+# Hidden Figures
+#===============
+
+# Pie charts for the frequencies.
+if (show.fig)
+{
+  print(ggplot(as.data.frame(table(df.gtwo$deg)), aes(x="", y=Freq, fill=Var1)) +
+          paletteer::scale_fill_paletteer_d("RColorBrewer::Paired") +
+          geom_bar(stat="identity", width=1, color="white") +
+          coord_polar("y", start=0) +
+          labs(title="Genes Present",
+               y="Frequency") +
+          theme.global +
+          theme(axis.title.x=element_blank(),
+                axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+          theme_void()  )
+}
+
+```
+
+```{r warning=FALSE}
+
+# Table of frequencies and proportions.
+tab.t <- table.to.data.frame(df.gtwo, c("deg"), 2)
+if (save.table) write.table(tab.t, paste0(path.n, "/E2-A table of exp.reg frequencies", df.config.tab), sep=",")
+
+# Also for each experiment.
+tab.t <- table.to.data.frame(df.gtwo[str_detect(df.gtwo$deg, fixed("apop")),], c("deg"), 1)
+if (save.table) write.table(tab.t, paste0(path.n, "/E2-A table of exp.reg apoptosis frequencies", df.config.tab), sep=",")
+tab.t <- table.to.data.frame(df.gtwo[str_detect(df.gtwo$deg, fixed("CICD")),], c("deg"), 1)
+if (save.table) write.table(tab.t, paste0(path.n, "/E2-A table of exp.reg cicd frequecies", df.config.tab), sep=",")
+
+
+# Histogram of the distributions.
+if (save.fig) png(paste0(path.f, "/E2-A UTR Lengths 1 histogram", df.config),
+                 width = 7, height = 4.35, units = 'in', res = 400)
+print(ggplot(df.gtwo, aes(x=utr, fill=deg)) +
+        paletteer::scale_fill_paletteer_d("RColorBrewer::Paired") +
+        geom_histogram(bins=100) +
+        coord_cartesian(xlim = quantile(df.gtwo$utr, c(0.05, 0.99), na.rm=TRUE)) +
+        labs(title="Distribution of UTR Lengths",
+             y="3'UTR Length") +
+        theme.global +
+        theme(axis.title.x=element_blank(),
+              axis.title.y=element_blank()) +
+        guides(fill=guide_legend(nrow = 2, byrow = FALSE))
+  )
+if (save.fig) dev.off()
+
+# Box plots of the spread (violin plot did not show a polarised distribution underneath).
+if (save.fig) png(paste0(path.f, "/E2-A UTR Lengths 2 boxplots", df.config),
+                 width = 4, height = 6, units = 'in', res = 400)
+print(ggplot(df.gtwo, aes(x=deg, y=utr, fill=deg)) +
+        paletteer::scale_fill_paletteer_d("RColorBrewer::Paired") +
+        # geom_violin(alpha=0.25) + 
+        geom_boxplot(outlier.color=NA) +
+        coord_cartesian(ylim = quantile(df.gtwo$utr, c(0.05, 0.99), na.rm=TRUE)) +
+        labs(title="Spread of 3'UTR Lengths",
+             y="3'UTR Length") +
+        theme.global +
+        theme(axis.title.x=element_blank(),
+              axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+              legend.text = element_text(size=8),
+              legend.box.margin=margin(0, 35, 0, 0)) +
+        guides(fill=guide_legend(nrow = 2, byrow = FALSE))
+  )
+if (save.fig) dev.off()
+
+rm(tab.t)
+
+```
+
+## E2-B are presence
+
+```{r}
+
+# Histogram of distribution.
+if (save.fig) png(paste0(path.f, "/E2-B ARE presence 1 histogram", df.config),
+                 width = 7, height = 4.35, units = 'in', res = 400)
+print(ggplot(df.gtwo, aes(x=utr, fill=ared)) +
+        paletteer::scale_fill_paletteer_d("RColorBrewer::Paired") +
+        geom_histogram(bins=100) +
+        coord_cartesian(xlim = quantile(df.gtwo$utr, c(0.05, 0.99), na.rm=TRUE)) +
+        labs(title="Distribution of UTR Lengths",
+             y="3'UTR Length") +
+        theme.global +
+        theme(axis.title.x=element_blank(),
+              axis.title.y=element_blank()) +
+        guides(fill=guide_legend(nrow = 1, byrow = FALSE))
+  )
+if (save.fig) dev.off()
+
+# Box plots of spread (violin plots did not show a polarised distribution).
+if (save.fig) png(paste0(path.f, "/E2-B ARE presence 2 boxplots", df.config),
+                 width = 7, height = 4.35, units = 'in', res = 400)
+print(ggplot(df.gtwo, aes(x=ared, y=utr, fill=deg)) +
+        paletteer::scale_fill_paletteer_d("RColorBrewer::Paired") +
+        # geom_violin(alpha=0.25) + 
+        geom_boxplot(outlier.color=NA) +
+        coord_cartesian(ylim = quantile(df.gtwo$utr, c(0.05, 0.99), na.rm=TRUE)) +
+        labs(title="Spread of 3'UTR Lengths",
+             y="3'UTR Length") +
+        theme.global +
+        theme(axis.title.x=element_blank()) +
+        guides(fill=guide_legend(nrow = 2, byrow = FALSE))
+  )
+if (save.fig) dev.off()
+
+```
+
+```{r}
+#===============
+# Hidden Figures
+#===============
+
+if (show.fig)
+{
+  # The world's worst pie chart.
+  print(ggplot(as.data.frame(table(df.gtwo$deg, df.gtwo$ared)), aes(x="", y=Freq, fill=paste0(Var1, ": ", Var2))) +
+          paletteer::scale_fill_paletteer_d("RColorBrewer::Paired") +
+          geom_bar(stat="identity", width=1, color="white") +
+          coord_polar("y", start=0) +
+          theme_void()  )
+  
+  
+  # Box plots of the spreads stratified in a way I don't like
+  print(ggplot(df.gtwo, aes(x=deg, y=utr, fill=ared)) +
+          paletteer::scale_fill_paletteer_d("rcartocolor::Safe") +
+          geom_boxplot(outlier.color=NA) +
+          coord_cartesian(ylim = quantile(df.gtwo$utr, c(0.05, 0.99), na.rm=TRUE)) +
+          labs(title="Spread of 3'UTR Lengths",
+               y="3'UTR Length") +
+          theme.global +
+          theme(axis.title.x=element_blank(),
+                axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+          guides(fill=guide_legend(nrow = 2, byrow = FALSE))  )
+}
+
+
+df.t <- df.gtwo[df.gtwo$ared=="With ARE", ]
+
+# Box plots of spread (violin plots did not show a polarised distribution).
+if (save.fig) png(paste0(path.f, "/E2-B ARE presence 3 violin", df.config),
+                 width = 7, height = 4.35, units = 'in', res = 400)
+print(ggplot(df.t, aes(x=ared, y=utr, fill=deg)) +
+        paletteer::scale_fill_paletteer_d("RColorBrewer::Paired") +
+        geom_violin( position=position_dodge(0.9), alpha=0.25) + 
+        geom_boxplot(position=position_dodge(0.9), outlier.color=NA, width=0.3) +
+        #coord_cartesian(ylim = quantile(df.gtwo$utr, c(0.05, 0.99), na.rm=TRUE)) +
+        labs(title="Spread of 3'UTR Lengths",
+             y="3'UTR Length") +
+        theme.global +
+        theme(axis.title.x=element_blank()) +
+        guides(fill=guide_legend(nrow = 2, byrow = FALSE))
+  )
+if (save.fig) dev.off()
+
+rm(df.t)
+
+```
+
+```{r}
+
+df.t <- df.gtwo[df.gtwo$ared=="With ARE", ]
+table(df.t$deg)*100/nrow(df.t)
+table(df.gtwo$deg)*100/nrow(df.gtwo)
+rm(df.t)
+
+tab.t <- table.to.data.frame(df.gtwo, "deg", deg=1)
+if (save.table) write.table(tab.t, paste0(path.n, "/E2-B Gene-Regulation proportions", df.config.tab), sep=",")
+
+tab.t <- table.to.data.frame(df.gtwo[df.gtwo$ared=="With ARE", ], "deg", deg=1)
+if (save.table) write.table(tab.t, paste0(path.n, "/E2-B Gene-Regulation proportions (AREs)", df.config.tab), sep=",")
+
+rm(tab.t)
+
+```
+
+
+
+## Statistical Tests
+
+```{r warning=FALSE}
+# Generate all the statistics between all the gene-regulation and ared combinations.
+
+stat.res.g <- data.frame(x=NA, y=NA, feature=NA, ared.x=NA, ared.y=NA, 
+                       same.distr=NA, same.median=NA, is.x.normal=NA, is.y.normal=NA, same.mean=NA, 
+                       n.x=NA, n.y=NA)
+stat.res.g <- rbind(stat.res.g, setNames(stat.tests(df.gtwo, "", "", "utr"), names(stat.res.g))) 
+
+for (i in 1:length(levels(df.gtwo$deg)))
+  for (j in i:length(levels(df.gtwo$deg)))
+    stat.res.g <- rbind(stat.res.g, setNames(stat.tests(df.gtwo, levels(df.gtwo$deg)[i], 
+                                                             levels(df.gtwo$deg)[j], "utr"), names(stat.res.g)))
+
+# Set feature types.
+stat.res.g <- stat.res.g[-1, ]
+rownames(stat.res.g) <- NULL
+stat.res.g$x      <- factor(stat.res.g$x, c(levels(df.gtwo$deg), ""))
+stat.res.g$y      <- factor(stat.res.g$y, c(levels(df.gtwo$deg), ""))
+stat.res.g$n.x    <- as.numeric(stat.res.g$n.x)
+stat.res.g$n.y    <- as.numeric(stat.res.g$n.y)
+stat.res.g$feature <- factor(stat.res.g$feature)
+stat.res.g$ared.x  <- factor(stat.res.g$ared.x)
+stat.res.g$ared.y  <- factor(stat.res.g$ared.y)
+
+for (c in which(colnames(stat.res.g) %in% c("same.distr", "same.median", "is.x.normal", "is.y.normal", "same.mean")))
+  stat.res.g[, c]  <- as.logical(stat.res.g[, c])
+stat.res.g$same.mean <- (stat.res.g$same.mean & stat.res.g$is.x.normal & stat.res.g$is.y.normal)
+
+stat.res.g
+
+```
+
+```{r}
+
+print("FOR THE UTR ANALYSIS::")
+print(paste0("The amount of combinations that have the same distribution are: ", 
+             round(sum(stat.res.g$same.distr*100/nrow(stat.res.g)), 2), "%"))
+print(paste0("The amount of combinations that have the same median is: ", 
+             round(sum(stat.res.g$same.median)*100/nrow(stat.res.g), 2), "%"))
+print(paste0("The amount of normal distributions are ", round(sum(stat.res.g$is.x.normal)*100/nrow(stat.res.g), 2), "% and ", round(sum(stat.res.g$is.y.normal)*100/nrow(stat.res.g), 2), "% (x and y, respectively)"))
+
+```
+
+```{r}
+
+# splitting by ARE causes a different distribution
+stat.res.g[stat.res.g$x==stat.res.g$y, ] 
+stat.res.g[stat.res.g$ared.x!=stat.res.g$ared.y, ]
+stat.res.g[rowSums(sapply(stat.res.g[, c(6, 7, 10)], as.numeric)) %in% c(0), ]
+
+# the wilcox test is applicable to static apop and static cicd against up_reg apop,
+# their means differ
+stat.res.g[rowSums(sapply(stat.res.g[, c(6, 7, 10)], as.numeric)) %in% c(1), ]
+
+# static cicd and up_reg cicd have the same distribution
+stat.res.g[rowSums(sapply(stat.res.g[, c(6, 7, 10)], as.numeric)) %in% c(2), ]
+
+```
+
+```{r}
+
+df.t  <- stat.res.g
+df.t$are  <- NA
+df.t$mean <- NA
+df.t$norm <- NA
+
+df.t[df.t$ared.x==""            & df.t$ared.y=="",            "are"] <- "Full Dataset"
+df.t[df.t$ared.x=="With ARE"    & df.t$ared.y=="With ARE",    "are"] <- "Only with AREs"
+df.t[df.t$ared.x=="With ARE"    & df.t$ared.y=="Without ARE", "are"] <- "Split by AREs"
+df.t[df.t$ared.x=="Without ARE" & df.t$ared.y=="Without ARE", "are"] <- "Without AREs"
+
+df.t[df.t$same.distr==TRUE  & df.t$same.median==TRUE,  "mean"] <- "Same Distribution"
+df.t[df.t$same.distr==FALSE & df.t$same.median==TRUE,  "mean"] <- "Same Medians"
+df.t[df.t$same.distr==TRUE  & df.t$same.median==FALSE, "mean"] <- "Shifted Distribution"
+df.t[df.t$same.distr==FALSE & df.t$same.median==FALSE, "mean"] <- "Totally Unrelated"
+
+df.t[df.t$is.x.normal==TRUE  & df.t$is.y.normal==TRUE,  "norm"] <- "Both are normal"
+df.t[df.t$is.x.normal==FALSE & df.t$is.y.normal==TRUE,  "norm"] <- "Y is normal"
+df.t[df.t$is.x.normal==TRUE  & df.t$is.y.normal==FALSE, "norm"] <- "X is normal"
+df.t[df.t$is.x.normal==FALSE & df.t$is.y.normal==FALSE, "norm"] <- "Neither are normal"
+
+df.t$are  <- factor(df.t$are,  c("Full Dataset", "Only with AREs", "Split by AREs", "Without AREs"))
+df.t$mean <- factor(df.t$mean, c("Same Distribution","Same Medians", "Shifted Distribution", "Totally Unrelated"))
+df.t$norm <- factor(df.t$norm, c("Both are normal", "Y is normal", "X is normal", "Neither are normal"))
+
+
+# if (save.fig) png(paste0(path.f, "/E2-C Significance 1", df.config),
+#                  width = 7, height = 4.35, units = 'in', res = 400)
+# print(ggplot(df.t, aes(x=mean, y=(1*100/nrow(df.t)), fill=are)) + 
+#       # colour.amc + scale_color_manual(values=amc) +
+#       paletteer::scale_fill_paletteer_d("NineteenEightyR::malibu", drop=F) +
+#       geom_bar(stat = "identity") + # geom_text(aes(label=n3, color=deg), vjust = -df.t$n2) + 
+#       coord_cartesian(ylim = c(0, 100)) + scale_x_discrete(drop = FALSE) +
+#       labs(title="Distributionn",
+#            x="Wilcox and T-test Results", y="Percentage (%)") +
+#       theme.global
+#     )
+# if (save.fig) dev.off()
+
+# rm(df.t)
+
+```
+
+```{r}
+df.t[df.t$mean=="Totally Unrelated" & df.t$are!="Split by AREs", ]
+```
+
+
+
+
+# E3 [df.cdna]
+
+## E3-A gene-regulation
+
+```{r}
+# df.t <- df.cdna
+# df.t$utr <- as.numeric(as.character(df.t[ , "length"]))
+# 
+# df.t$n <- NA
+# for (i in names(table(df.t$deg)))
+#   df.t[df.t$deg==i, "n"] <- sum(df.t$deg==i)
+# 
+# df.t$n2 <- (df.t$n/180)
+# df.t$n3  <- paste0(round(df.t$n*100/nrow(df.t), 1), "%")
+# df.t[df.t$deg==names(table(df.t$deg))[3], "n2"] <- df.t$n2[df.t$deg==names(table(df.t$deg))[3]] + 0.5
+# df.t[df.t$deg==names(table(df.t$deg))[4], "n2"] <- df.t$n2[df.t$deg==names(table(df.t$deg))[4]] - 1.5
+# df.t[df.t$deg==names(table(df.t$deg))[7], "n2"] <- df.t$n2[df.t$deg==names(table(df.t$deg))[7]] + 0.5
+# df.t[df.t$deg==names(table(df.t$deg))[5], "n2"] <- df.t$n2[df.t$deg==names(table(df.t$deg))[5]] / 1.5
+# 
+# 
+# # Confusing bar chart of frequencies.
+# if (save.fig) png(paste0(path.f, "/E3-A Gene-Regulation 1a frequencies", df.config),
+#                  width = 7, height = 4.35, units = 'in', res = 400)
+# print(ggplot(df.t, aes(x=deg, y=1, fill=deg)) + 
+#       colour.amc + scale_color_manual(values=amc) +
+#       geom_bar(stat = "identity") + geom_text(aes(label=n3, color=deg), vjust = -df.t$n2) + 
+#       coord_cartesian(ylim = c(0, 7000)) +
+#       labs(title="Frequencies of Each Gene-Regulation Combination",
+#            y="Frequency") +
+#       theme.global +
+#       theme(axis.title.x=element_blank(),
+#             axis.text.x=element_blank()) + 
+#       guides(fill=guide_legend(nrow = 3, byrow = FALSE))  )
+# if (save.fig) dev.off()
+# 
+# 
+# df.t <- df.t[df.t$deg!=names(table(df.t$deg))[5], ]
+# df.t$n2 <- (df.t$n/60) + 1.5
+# df.t[df.t$deg==names(table(df.t$deg))[3], "n2"] <- df.t$n2[df.t$deg==names(table(df.t$deg))[3]] - 0.5
+# df.t[df.t$deg==names(table(df.t$deg))[7], "n2"] <- df.t$n2[df.t$deg==names(table(df.t$deg))[7]] - 1.0
+# df.t[df.t$deg==names(table(df.t$deg))[4], "n2"] <- df.t$n2[df.t$deg==names(table(df.t$deg))[4]] + 0.5
+# df.t$n3  <- paste0(round(df.t$n*100/nrow(df.t), 1), "%")
+# 
+# if (save.fig) png(paste0(path.f, "/E3-A Gene-Regulation 1b frequencies", df.config),
+#                  width = 7, height = 4.35, units = 'in', res = 400)
+# print(ggplot(df.t, aes(x=deg, y=1, fill=deg)) + 
+#       colour.amc + scale_color_manual(values=amc, drop=FALSE) +
+#       # geom_bar(stat = "identity") + geom_text(aes(label=n, color=deg), vjust = -df.t$n2) + 
+#       geom_bar(stat = "identity") + geom_text(aes(label=n3, color=deg), vjust = -df.t$n2) + 
+#       coord_cartesian(ylim = c(0, 1500)) +
+#       labs(# title="Frequencies of Each Gene-Regulation Combination",
+#            y="Frequency") +
+#       theme.global +
+#       theme(axis.title.x=element_blank(),
+#             axis.text.x=element_blank()) + 
+#       guides(fill=guide_legend(nrow = 3, byrow = FALSE), label="none", color="none")  )
+# if (save.fig) dev.off()
+# 
+# # XXX would prefer a side by side spread
+# if (save.fig) png(paste0(path.f, "/E3-A Gene-Regulation 2 utr spread", df.config),
+#                  width = 7, height = 4.35, units = 'in', res = 400)
+# print(ggplot(df.t, aes(x=ared, y=utr, fill=deg)) +
+#         colour.amc + 
+#         geom_boxplot(outlier.color=NA) +
+#         # geom_violin () +
+#         coord_cartesian(ylim = quantile(df.t$utr, c(0.05, 0.99), na.rm=TRUE)) +
+#         labs(title="Spread of 3'UTR Lengths",
+#              y="3'UTR Length") +
+#         theme.global +
+#         theme(axis.title.x=element_blank()) +
+#         guides(fill=guide_legend(nrow = 3, byrow = FALSE))
+#   )
+# if (save.fig) dev.off()
+# 
+# tab.t <- table.to.data.frame(df.t, c("deg"), 2)
+# if (save.table) write.table(tab.t, paste0(path.n, "/E3-A Gene-Regulation table of frequencies", df.config.tab), sep=",")
+# 
+# 
+# rm(df.t, tab.t)
+
+```
+
+```{r}
+
+df.t <- df.cdna
+df.t$utr <- as.numeric(as.character(df.t[ , "length"]))
+
+ print(ggplot(df.t, aes(x=deg, y=utr, fill=ared)) +
+          paletteer::scale_fill_paletteer_d("rcartocolor::Safe") +
+          geom_boxplot(outlier.color=NA) +
+          coord_cartesian(ylim = quantile(df.t$utr, c(0.05, 0.99), na.rm=TRUE)) +
+          labs(title="Spread of 3'UTR Lengths",
+               y="3'UTR Length") +
+          theme.global +
+          theme(axis.title.x=element_blank(),
+                axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+          guides(fill=guide_legend(nrow = 2, byrow = FALSE))  )
+
+```
+
+
+
+## E3-B gc content
+
+
+
+```{r warning=FALSE}
+if (save.fig) png(paste0(path.f, "/E3-B 1 seq.count frequencies", df.config),
+                 width = 7, height = 4.35, units = 'in', res = 400)
+print(ggplot(df.cdna, aes(x=number.of.sequences)) +#, fill=deg)) +
+        colour.amc + 
+        geom_histogram() +
+        labs(title="Frequencies of Associated cDNA Seqeuences per Gene",
+             x="Number of Sequences per EntrezID", y="Frequency") +
+        theme.global +
+        theme(axis.title.y=element_blank())
+  )
+if (save.fig) dev.off()
+
+
+#===============
+# Hidden Figures
+#===============
+if (show.fig)
+{
+
+# Scatter graph to better understand the gc.prop distribution.
+  print(ggplot(df.cdna, aes(x=gc.prop, y=length, colour=ared)) +#, fill=deg)) +
+        paletteer::scale_colour_paletteer_d("RSkittleBrewer::tropical") +
+        geom_point(alpha=1)  )
+
+  # Scatter graphs to find relationships between variables.
+  print(ggplot(df.cdna, aes(x=gc.prop, y=number.of.sequences)) +#, fill=deg)) +
+          scale_fill_manual(values=amc) +
+          geom_point(alpha=0.1)  )
+  # 
+  print(ggplot(df.cdna, aes(x=gc.count, y=number.of.sequences)) +#, fill=deg)) +
+          scale_fill_manual(values=amc) +
+          geom_point(alpha=0.1)  )
+  # 
+  print(ggplot(df.cdna, aes(x=length, y=number.of.sequences)) +#, fill=deg)) +
+          scale_fill_manual(values=amc) +
+          geom_point(alpha=0.1)  )
+  
+  
+  # Histogram of seq.count by ARE presence.
+  print(ggplot(df.cdna, aes(x=number.of.sequences, fill=ared)) +#, fill=deg)) +
+          # colour.amc + 
+           geom_histogram(color='#e9ecef', alpha=0.7, position="identity") + 
+          labs(title="Spread of 3'UTR Lengths",
+               x="Number of Sequences per EntrezID", y="Frequency") +
+          theme.global +
+          theme(axis.title.y=element_blank())
+    )
+}
+
+```
+
+
+```{r warning=FALSE}
+
+if (save.fig) png(paste0(path.f, "/E3-B GC 1 gc.prop frequencies", df.config),
+                  width = 7, height = 4.35, units = 'in', res = 400)
+  print(ggplot(df.cdna, aes(x=gc.prop)) +#, fill=deg)) +
+          # colour.amc + 
+          geom_histogram(bins=50, alpha=0.7, position="identity") + #facet_wrap(~ared, scale="free") +
+          labs(title="Spread of GC-content in 3'UTRs",
+               x="Proportion of Bases that are G or C", y="Frequency") +
+         theme.global +
+         theme(axis.title.y=element_blank())
+    )
+if (save.fig) dev.off()
+
+if (as.numeric(shapiro.test(df.cdna$gc.prop)$p.value) < alpha)
+  print("The full GC proportion distribution is not normal.")
+
+
+if (save.fig) png(paste0(path.f, "/E3-B GC 1 gc.prop frequencies by are", df.config),
+                 width = 7, height = 4.35, units = 'in', res = 400)
+print(ggplot(df.cdna, aes(x=gc.prop, fill=ared)) +#, fill=deg)) +
+        # colour.amc + 
+        geom_histogram(bins=50, alpha=0.7, position="identity") + #facet_wrap(~ared, scale="free") +
+        labs(title="Spread of GC-content in 3'UTRs",
+             x="Proportion of Bases that are G or C", y="Frequency") +
+       theme.global +
+       theme(axis.title.y=element_blank())
+  )
+if (save.fig) dev.off()
+
+
+# Significance tests.
+df.a <- df.cdna[df.cdna$ared=="With ARE",    "gc.prop"]
+df.b <- df.cdna[df.cdna$ared=="Without ARE", "gc.prop"]
+
+if (as.numeric(ks.test(df.a, df.b)$p.value) < alpha)
+  print("The distributions of GC proportions split by ARE presence come from different disrtibutions.")
+if (as.numeric(wilcox.test(df.a, df.b)$p.value) < alpha)
+  print("Their distributions have different medians")
+if ((as.numeric(shapiro.test(df.a)$p.value) < alpha) & 
+    (as.numeric(shapiro.test(df.b)$p.value) < alpha))
+  print("Neither distribution is normal.")
+
+rm(df.a, df.b)
+
+```
+
+```{r warning=FALSE}
+
+df.t <- data.frame(utr=c(df.cdna$length, df.cdna$gc.count),
+                   type=c(rep("length", nrow(df.cdna)), rep("gc.count", nrow(df.cdna))))
+if (save.fig) png(paste0(path.f, "/E3-B GC 1 gc and seq.length occurances", df.config),
+                 width = 7, height = 4.35, units = 'in', res = 400)
+print(ggplot(df.t, aes(x=utr, fill=type)) + 
+        #colour.amc + 
+        geom_histogram(bins=80, alpha=0.7, position="identity") + #facet_wrap(~ared, scale="free") +
+        labs(title="Counts of GC bases per Sequence and Frequencies of Sequence Lengths",
+             x="3'UTR Sequence Length", y="Occurances") +
+        theme.global 
+  )
+if (save.fig) dev.off()
+rm(df.t)
+
+
+# Significance tests.
+if (as.numeric(ks.test(df.cdna$length, df.cdna$gc.count)$p.value) < alpha)
+  print("The sequence lengths and GC counts come from different disrtibutions.")
+if (as.numeric(wilcox.test(df.cdna$length, df.cdna$gc.count)$p.value) < alpha)
+  print("Their distributions have different medians")
+if ((as.numeric(shapiro.test(df.cdna$length)$p.value) < alpha) & 
+    (as.numeric(shapiro.test(df.cdna$gc.count)$p.value) < alpha))
+  print("Neither distribution is normal.")
+
+```
+
+
+
+```{r warning=FALSE}
+
+#===============
+# Hidden Figures
+#===============
+# GC plots but flipped to be AT/AU. They are symmetrical.
+if (show.fig)
+{
+  df.t <- df.cdna
+  df.t$au.prop  <- 1 - df.t$gc.prop
+  df.t$au.count <- df.t$au.prop * df.t$length
+  
+  if (save.fig) png(paste0(path.f, "/E3-B GC 1 au.prop frequencies by are", df.config),
+                   width = 7, height = 4.35, units = 'in', res = 400)
+  print(ggplot(df.t, aes(x=au.prop, fill=ared)) +#, fill=deg)) +
+          # colour.amc + 
+          geom_histogram(bins=50, alpha=0.7, position="identity") + #facet_wrap(~ared, scale="free") +
+          labs(title="Spread of AT-content in 3'UTRs",
+               x="Proportion of Bases that are A or T", y="Frequency") +
+         theme.global +
+         theme(axis.title.y=element_blank())
+    )
+  if (save.fig) dev.off()
+  
+  
+  if (as.numeric(ks.test(df.t$length, df.t$au.count)$p.value) < alpha)
+    print("The sequence lengths and AT proportions come from different disrtibutions.")
+  if (as.numeric(wilcox.test(df.t$length, df.t$au.count)$p.value) < alpha)
+    print("Their distributions have different medians")
+  if ((as.numeric(shapiro.test(df.t$length)$p.value) < alpha) & 
+      (as.numeric(shapiro.test(df.t$au.count)$p.value) < alpha))
+    print("Neither distribution is normal.")
+
+  df.t <- data.frame(utr=c(df.t$length, df.t$au.count),
+                     type=c(rep("length", nrow(df.t)), rep("au.count", nrow(df.t))))
+  
+  if (save.fig) png(paste0(path.f, "/E3-B GC 1 au and seq.length occurances", df.config),
+                   width = 7, height = 4.35, units = 'in', res = 400)
+  print(ggplot(df.t, aes(x=utr, fill=type)) + 
+          #colour.amc + 
+          geom_histogram(bins=80, alpha=0.7, position="identity") + #facet_wrap(~ared, scale="free") +
+          labs(title="Counts of AT bases per Sequence and Frequencies of Sequence Lengths",
+               x="3'UTR Sequence Length", y="Occurances") +
+          theme.global 
+    )
+  if (save.fig) dev.off()
+  
+  rm(df.t)
+}
+
+```
+
+
+
+
+# E4 [df.cdna]
+
+## dataframe
+
+```{r}
+# Modifying df.g to plot the apoptosis and CICD results with gene-regulation labels.
+
+df.t <- df.cdna
+# df.t$utr <- df.t$length
+df.t <- data.frame(utr=(c(df.t[, c("length")],  df.t[, c("length")])),
+                         gc= c(df.t[,c("gc.prop")],df.t[, c("gc.prop")]),
+                        deg= c(df.t[, c("deg.a")], df.t[, c("deg.c")]),
+                        ared=c(df.t[, c("ared")],  df.t[, c("ared")]))
+
+# df.t$exp <- substring(df.t$deg,    str_locate(df.t$deg, fixed(sep.v))[,1]+nchar(sep.v))
+# df.t$reg <- substring(df.t$deg, 1, str_locate(df.t$deg, fixed(sep.v))[,1]-1)
+
+# df.t$deg <- factor(df.t$deg, unique(df.t$deg)[c(1,4, 2,5, 3,6)])
+# df.t$deg <- factor(df.t$deg, unique(df.t$deg)[c(3,6, 1,4, 2,5)])
+# df.t$exp <- factor(df.t$exp)
+# df.t$reg <- factor(df.t$reg, reg.list)
+
+
+df.ctwo <- df.t
+rm(df.t)
+
+if (show.fig) df.ctwo
+
+```
+
+
+## E4-A utr lengths
+
+```{r warning=FALSE}
+
+# Table of frequencies and proportions.
+tab.t <- table.to.data.frame(df.ctwo, c("deg"), 2)
+if (save.table) write.table(tab.t, paste0(path.n, "/E4-A table of exp.reg frequencies", df.config.tab), sep=",")
+
+# Also for each experiment.
+tab.t <- table.to.data.frame(df.ctwo[str_detect(df.ctwo$deg, fixed("apop")),], c("deg"), 1)
+if (save.table) write.table(tab.t, paste0(path.n, "/E4-A table of exp.reg apoptosis frequencies", df.config.tab), sep=",")
+tab.t <- table.to.data.frame(df.ctwo[str_detect(df.ctwo$deg, fixed("CICD")),], c("deg"), 1)
+if (save.table) write.table(tab.t, paste0(path.n, "/E4-A table of exp.reg cicd frequencies", df.config.tab), sep=",")
+
+
+# Histogram of the distributions.
+if (save.fig) png(paste0(path.f, "/E4-A UTR Lengths 1 histogram", df.config),
+                 width = 7, height = 4.35, units = 'in', res = 400)
+print(ggplot(df.ctwo, aes(x=utr, fill=deg)) +
+        paletteer::scale_fill_paletteer_d("RColorBrewer::Paired") +
+        geom_histogram(bins=100) +
+        coord_cartesian(xlim = quantile(df.ctwo$utr, c(0.05, 0.99), na.rm=TRUE)) +
+        labs(title="Distribution of UTR Lengths",
+             y="3'UTR Length") +
+        theme.global +
+        theme(axis.title.x=element_blank(),
+              axis.title.y=element_blank()) +
+        guides(fill=guide_legend(nrow = 2, byrow = FALSE))
+  )
+if (save.fig) dev.off()
+
+# Box plots of the spread (violin plot did not show a polarised distribution underneath).
+if (save.fig) png(paste0(path.f, "/E4-A UTR Lengths 2 boxplots", df.config),
+                 width = 4, height = 6, units = 'in', res = 400)
+print(ggplot(df.ctwo, aes(x=deg, y=utr, fill=deg)) +
+        paletteer::scale_fill_paletteer_d("RColorBrewer::Paired") +
+        # geom_violin(alpha=0.25) + 
+        geom_boxplot(outlier.color=NA) +
+        coord_cartesian(ylim = quantile(df.ctwo$utr, c(0.05, 0.99), na.rm=TRUE)) +
+        labs(title="Spread of 3'UTR Lengths",
+             y="3'UTR Length") +
+        theme.global +
+        theme(axis.title.x=element_blank(),
+              axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+              legend.text = element_text(size=8),
+              legend.box.margin=margin(0, 35, 0, 0)) +
+        guides(fill=guide_legend(nrow = 2, byrow = FALSE))
+  )
+if (save.fig) dev.off()
+
+rm(tab.t)
+
+```
+
+
+
+## E4-B are presence
+
+```{r}
+
+# Histogram of distribution.
+if (save.fig) png(paste0(path.f, "/E4-B ARE presence 1 histogram", df.config),
+                 width = 7, height = 4.35, units = 'in', res = 400)
+print(ggplot(df.ctwo, aes(x=utr, fill=ared)) +
+        paletteer::scale_fill_paletteer_d("RColorBrewer::Paired") +
+        geom_histogram(bins=100) +
+        coord_cartesian(xlim = quantile(df.ctwo$utr, c(0.05, 0.99), na.rm=TRUE)) +
+        labs(title="Distribution of UTR Lengths",
+             y="3'UTR Length") +
+        theme.global +
+        theme(axis.title.x=element_blank(),
+              axis.title.y=element_blank()) +
+        guides(fill=guide_legend(nrow = 1, byrow = FALSE))
+  )
+if (save.fig) dev.off()
+
+# Box plots of spread (violin plots did not show a polarised distribution).
+if (save.fig) png(paste0(path.f, "/E4-B ARE presence 2 boxplots", df.config),
+                 width = 7, height = 4.35, units = 'in', res = 400)
+print(ggplot(df.ctwo, aes(x=ared, y=utr, fill=deg)) +
+        paletteer::scale_fill_paletteer_d("RColorBrewer::Paired") +
+        # geom_violin(alpha=0.25) + 
+        geom_boxplot(outlier.color=NA) +
+        coord_cartesian(ylim = quantile(df.ctwo$utr, c(0.05, 0.99), na.rm=TRUE)) +
+        labs(title="Spread of 3'UTR Lengths",
+             y="3'UTR Length") +
+        theme.global +
+        theme(axis.title.x=element_blank()) +
+        guides(fill=guide_legend(nrow = 2, byrow = FALSE))
+  )
+if (save.fig) dev.off()
+
+```
+
+```{r}
+
+df.t <- df.ctwo[df.ctwo$ared=="With ARE", ]
+table(df.t$deg)*100/nrow(df.t)
+table(df.ctwo$deg)*100/nrow(df.ctwo)
+rm(df.t)
+
+tab.t <- table.to.data.frame(df.ctwo, "deg", deg=1)
+if (save.table) write.table(tab.t, paste0(path.n, "/E4-B Gene-Regulation proportions", df.config.tab), sep=",")
+
+tab.t <- table.to.data.frame(df.ctwo[df.ctwo$ared=="With ARE", ], "deg", deg=1)
+if (save.table) write.table(tab.t, paste0(path.n, "/E4-B Gene-Regulation proportions (AREs)", df.config.tab), sep=",")
+
+rm(tab.t)
+
+```
+
+
+
+
+## E4-C gc content
+
+```{r}
+
+# Histogram of distribution.
+if (save.fig) png(paste0(path.f, "/E4-C GC prop 1a histogram", df.config),
+                 width = 7, height = 4.35, units = 'in', res = 400)
+print(ggplot(df.ctwo, aes(x=gc, fill=ared)) +
+        paletteer::scale_fill_paletteer_d("RColorBrewer::Paired") +
+        geom_histogram(bins=100) +
+        coord_cartesian(xlim = quantile(df.ctwo$gc, c(0.05, 0.99), na.rm=TRUE)) +
+        labs(title="Distribution of GC Intensity",
+             y="Proportion of GC-bases") +
+        theme.global +
+        theme(axis.title.x=element_blank(),
+              axis.title.y=element_blank()) +
+        guides(fill=guide_legend(nrow = 1, byrow = FALSE))
+  )
+if (save.fig) dev.off()
+
+if (save.fig) png(paste0(path.f, "/E4-C GC prop 1b histogram", df.config),
+                 width = 4, height = 6, units = 'in', res = 400)
+print(ggplot(df.ctwo, aes(x=gc, fill=deg)) +
+        paletteer::scale_fill_paletteer_d("RColorBrewer::Paired") +
+        geom_histogram(bins=100) +
+        coord_cartesian(xlim = quantile(df.ctwo$gc, c(0.05, 0.99), na.rm=TRUE)) +
+        labs(title="Distribution of GC Intensity",
+             y="Proportion of GC-bases") +
+        theme.global +
+        theme(axis.title.x=element_blank(),
+              axis.title.y=element_blank()) +
+        guides(fill=guide_legend(nrow = 2, byrow = FALSE))
+  )
+if (save.fig) dev.off()
+
+
+
+# Box plots of spread (violin plots did not show a polarised distribution).
+if (save.fig) png(paste0(path.f, "/E4-C GC prop 2 boxplots", df.config),
+                 width = 4, height = 6, units = 'in', res = 400)
+print(ggplot(df.ctwo, aes(x=deg, y=gc, fill=deg)) +
+        paletteer::scale_fill_paletteer_d("RColorBrewer::Paired") +
+        # geom_violin(alpha=0.25) + 
+        geom_boxplot(outlier.color=NA) +
+        coord_cartesian(ylim = c(0,1)) +
+        labs(title="Spread of GC Intensity",
+             y="Proportion of GC-bases") +
+        theme.global +
+        theme(axis.title.x=element_blank()) +
+        guides(fill=guide_legend(nrow = 2, byrow = FALSE))
+  )
+if (save.fig) dev.off()
+
+if (save.fig) png(paste0(path.f, "/E4-C GC prop 2a boxplots", df.config),
+                 width = 7, height = 4.35, units = 'in', res = 400)
+print(ggplot(df.ctwo, aes(x=ared, y=gc, fill=deg)) +
+        paletteer::scale_fill_paletteer_d("RColorBrewer::Paired") +
+        # geom_violin(alpha=0.25) + 
+        geom_boxplot(outlier.color=NA) +
+        coord_cartesian(ylim = quantile(df.ctwo$gc, c(0.05, 0.99), na.rm=TRUE)) +
+        labs(title="Spread of GC Intensity",
+             y="Proportion of GC-bases") +
+        theme.global +
+        theme(axis.title.x=element_blank()) +
+        guides(fill=guide_legend(nrow = 2, byrow = FALSE))
+  )
+if (save.fig) dev.off()
+
+if (save.fig) png(paste0(path.f, "/E4-C GC prop 2b boxplots", df.config),
+                 width = 7, height = 4.35, units = 'in', res = 400)
+print(ggplot(df.ctwo, aes(x=deg, y=gc, fill=ared)) +
+        paletteer::scale_fill_paletteer_d("RColorBrewer::Paired") +
+        # geom_violin(alpha=0.25) + 
+        geom_boxplot(outlier.color=NA) +
+        coord_cartesian(ylim = quantile(df.ctwo$gc, c(0.05, 0.99), na.rm=TRUE)) +
+        labs(title="Spread of GC Intensity",
+             y="Proportion of GC-bases") +
+        theme.global +
+        theme(axis.title.x=element_blank()) +
+        guides(fill=guide_legend(nrow = 2, byrow = FALSE))
+  )
+if (save.fig) dev.off()
+
+
+```
+
+
+
+## Statistical Tests
+
+```{r warning=FALSE}
+# Generate all the statistics between all the gene-regulation and ared combinations.
+df.t <- list()
+
+for (f.val in c("utr", "gc"))
+{
+  stat.res.c <- data.frame(x=NA, y=NA, feature=NA, ared.x=NA, ared.y=NA, 
+                         same.distr=NA, same.median=NA, is.x.normal=NA, is.y.normal=NA, same.mean=NA, 
+                         n.x=NA, n.y=NA)
+  stat.res.c <- rbind(stat.res.c, setNames(stat.tests(df.ctwo, "", "", f.val), names(stat.res.c))) 
+  
+  for (i in 1:length(levels(df.ctwo$deg)))
+    for (j in i:length(levels(df.ctwo$deg)))
+      stat.res.c <- rbind(stat.res.c, setNames(stat.tests(df.ctwo, levels(df.ctwo$deg)[i], 
+                                                               levels(df.ctwo$deg)[j], f.val), names(stat.res.c)))
+  
+  # Set feature types.
+  stat.res.c <- stat.res.c[-1, ]
+  rownames(stat.res.c) <- NULL
+  stat.res.c$x      <- factor(stat.res.c$x, c(levels(df.ctwo$deg), ""))
+  stat.res.c$y      <- factor(stat.res.c$y, c(levels(df.ctwo$deg), ""))
+  stat.res.c$n.x    <- as.numeric(stat.res.c$n.x)
+  stat.res.c$n.y    <- as.numeric(stat.res.c$n.y)
+  stat.res.c$feature <- factor(stat.res.c$feature)
+  stat.res.c$ared.x  <- factor(stat.res.c$ared.x)
+  stat.res.c$ared.y  <- factor(stat.res.c$ared.y)
+  
+  for (c in which(colnames(stat.res.c) %in% c("same.distr", "same.median", "is.x.normal", "is.y.normal", "same.mean")))
+    stat.res.c[, c]  <- as.logical(stat.res.c[, c])
+  stat.res.c$same.mean <- (stat.res.c$same.mean & stat.res.c$is.x.normal & stat.res.c$is.y.normal)
+  
+  df.t[[length(df.t)+1]] <- stat.res.c
+}
+
+stat.res.c.utr <- df.t[[1]]
+stat.res.c.gc  <- df.t[[2]]
+rm(df.t, stat.res.c)
+
+stat.res.c.utr
+stat.res.c.gc
+
+```
+
+
+```{r}
+
+print("FOR THE UTR ANALYSIS::")
+print(paste0("The amount of combinations that have the same distribution are: ", 
+             round(sum(stat.res.c.utr$same.distr*100/nrow(stat.res.c.utr)), 2), "%"))
+print(paste0("The amount of combinations that have the same median is: ", 
+             round(sum(stat.res.c.utr$same.median)*100/nrow(stat.res.c.utr), 2), "%"))
+print(paste0("The amount of normal distributions are ", round(sum(stat.res.c.utr$is.x.normal)*100/nrow(stat.res.c.utr), 2), "% and ", round(sum(stat.res.c.utr$is.y.normal)*100/nrow(stat.res.c.utr), 2), "% (x and y, respectively)"))
+
+```
+this tells us the UTR analysis was completely pointless for this dataset (likely due to the way ARE presence was assigned)
+
+```{r}
+
+print("FOR THE GC ANALYSIS::")
+print(paste0("The amount of combinations that have the same distribution are: ", 
+             round(sum(stat.res.c.gc$same.distr*100/nrow(stat.res.c.gc)), 2), "%"))
+print(paste0("The amount of combinations that have the same median is: ", 
+             round(sum(stat.res.c.gc$same.median)*100/nrow(stat.res.c.gc), 2), "%"))
+print(paste0("The amount of normal distributions are ", round(sum(stat.res.c.gc$is.x.normal)*100/nrow(stat.res.c.gc), 2), "% and ", round(sum(stat.res.c.gc$is.y.normal)*100/nrow(stat.res.c.gc), 2), "% (x and y, respectively)"))
+
+```
+
+
+
+```{r}
+
+# splitting by ARE causes a different distribution except in down_reg apoptosis
+stat.res.c.gc[stat.res.c.gc$x==stat.res.c.gc$y, ] 
+
+# comparing the distributions, they're normally the same other than up-reg CICD and down-reg apoptosis
+stat.res.c.gc[stat.res.c.gc$ared.x==stat.res.c.gc$ared.y, -c(3,5,8,9)]
+
+# when comparing the impact of are stratification
+stat.res.c.gc[stat.res.c.gc$ared.x!=stat.res.c.gc$ared.y, ]
+
+# those that definitely varied (up-reg CICD and down-reg apoptosis)
+stat.res.c.gc[rowSums(sapply(stat.res.c.gc[, c(6, 7, 10)], as.numeric)) %in% c(0), ]
+
+# static cicd and up_reg cicd have the same distribution?
+stat.res.c.gc[rowSums(sapply(stat.res.c.gc[, c(6, 7, 10)], as.numeric)) %in% c(2), ]
+
+# results where both subgroups were normal.
+stat.res.c.gc[rowSums(sapply(stat.res.c.gc[, c(8, 9)], as.numeric)) %in% c(2), ]
+
+```
+
+```{r}
+
+df.t  <- stat.res.c.gc
+df.t$are  <- NA
+df.t$mean <- NA
+df.t$norm <- NA
+
+df.t[df.t$ared.x==""            & df.t$ared.y=="",            "are"] <- "Full Dataset"
+df.t[df.t$ared.x=="With ARE"    & df.t$ared.y=="With ARE",    "are"] <- "Only with AREs"
+df.t[df.t$ared.x=="With ARE"    & df.t$ared.y=="Without ARE", "are"] <- "Split by AREs"
+df.t[df.t$ared.x=="Without ARE" & df.t$ared.y=="Without ARE", "are"] <- "Without AREs"
+
+df.t[df.t$same.distr==TRUE  & df.t$same.median==TRUE,  "mean"] <- "Same Distribution"
+df.t[df.t$same.distr==FALSE & df.t$same.median==TRUE,  "mean"] <- "Same Medians"
+df.t[df.t$same.distr==TRUE  & df.t$same.median==FALSE, "mean"] <- "Shifted Distribution"
+df.t[df.t$same.distr==FALSE & df.t$same.median==FALSE, "mean"] <- "Totally Unrelated"
+
+df.t[df.t$is.x.normal==TRUE  & df.t$is.y.normal==TRUE,  "norm"] <- "Both are normal"
+df.t[df.t$is.x.normal==FALSE & df.t$is.y.normal==TRUE,  "norm"] <- "Y is normal"
+df.t[df.t$is.x.normal==TRUE  & df.t$is.y.normal==FALSE, "norm"] <- "X is normal"
+df.t[df.t$is.x.normal==FALSE & df.t$is.y.normal==FALSE, "norm"] <- "Neither are normal"
+
+df.t$are  <- factor(df.t$are,  c("Full Dataset", "Only with AREs", "Split by AREs", "Without AREs"))
+df.t$mean <- factor(df.t$mean, c("Same Distribution","Same Medians", "Shifted Distribution", "Totally Unrelated"))
+df.t$norm <- factor(df.t$norm, c("Both are normal", "Y is normal", "X is normal", "Neither are normal"))
+
+
+if (save.fig) png(paste0(path.f, "/E2-C Significance 1", df.config),
+                 width = 7, height = 4.35, units = 'in', res = 400)
+print(ggplot(df.t, aes(x=mean, y=(1*100/nrow(df.t)), fill=are)) + 
+      # colour.amc + scale_color_manual(values=amc) +
+      paletteer::scale_fill_paletteer_d("NineteenEightyR::malibu", drop=F) +
+      geom_bar(stat = "identity") + # geom_text(aes(label=n3, color=deg), vjust = -df.t$n2) + 
+      coord_cartesian(ylim = c(0, 100)) + scale_x_discrete(drop = FALSE) +
+      labs(title="Distributionn",
+           x="Wilcox and T-test Results", y="Percentage (%)") +
+      theme.global
+    )
+if (save.fig) dev.off()
+
+# rm(df.t)
+
+```
+
+```{r}
+df.t[df.t$mean=="Totally Unrelated" & df.t$are!="Split by AREs", ]
+```
+
+
+
+
+
+
+
+
+
+
+# blegh
+
+```{r}
+stop("staph--")
+```
+
+```{r}
+
+ks.test(utr.ins, utr.out) 
+#  Low (enough) p-value, so they are not from the same distribution.
+
+# Are either normally distributed?
+shapiro.test(utr.ins)
+shapiro.test(utr.out)
+
+wilcox.test(utr.clt.ins, utr.clt.out)
+
+t.test(utr.clt.ins, utr.clt.out)
+
+
+
+# Since the datasets are large enough to use CLT even with 10 per batch (1,256 and 4,624), lets try that.
+# source: https://www.statology.org/central-limit-theorem-in-r/
+
+m <- 25 # Samples per batch.
+
+utr.clt.up <- c()
+n <- floor(length(utr.up)/m) # Number of batches.
+for (i in 1:n) utr.clt.up[i] = mean(sample(utr.up, m, replace=FALSE))
+hist(utr.clt.up, breaks=15, main=paste0("Histogram of ", n, " batches of size ", m, " each"))
+
+```
+

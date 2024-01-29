@@ -1,0 +1,1221 @@
+---
+title: "P1 Exploration"
+author: "Olive Kirk"
+date: "24/02/2022"
+output: pdf_document
+---
+
+Performing data exploration and differential gene analysis on the raw and processed gene-expression data.
+
+
+# Imports
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+# Import libraries.
+
+knitr::opts_chunk$set(echo = TRUE)
+
+# Core computational packages.
+library(clusterProfiler)
+library(DESeq2)
+library(matrixStats)
+library(preprocessCore)
+library(org.Mm.eg.db)
+
+# Visualisation packages.
+library(ggplot2)
+library(RVenn)
+library(ggfortify)
+
+# Coding preference packages.
+library(readr)
+library(tibble)
+library(data.table)
+
+
+set.seed(42)  
+options("scipen"=10, "digits"=4)
+
+```
+
+```{r}
+
+# Define functions.
+
+# Transpose matrix and retain the name values.
+t_pose <- function(d) {
+  print(typeof(d))
+  df_t <- data.table::transpose(d)
+  print(typeof(df_t))
+  rownames(df_t) <- colnames(d)
+  colnames(df_t) <- rownames(d)
+  d <- df_t
+  
+  return(d)
+}
+
+```
+
+## reading data
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+# Import data, fix column names, and crop it to the raw result values.
+
+df <- read_csv("data/RNAseq_dataset_FB.csv")
+
+# Duplicates for later to ensure a good replica is made.
+ORIGINAL_DATASET <- df
+df_ogp <- df[,c(which(colnames(df)=="Apoptosis padj"), which(colnames(df)=="BAXBAK padj"), which(colnames(df)=="CICD padj"))]
+df_ogf <- df[,c(which(colnames(df)=="Apoptosis FC"), which(colnames(df)=="BAXBAK FC"), which(colnames(df)=="CICD FC"))]
+
+# Gather the ensemble gene id and the raw GE values of all 18 samples.
+df <- df[,c(4, 22:39)]
+df_names <- read_csv("data/RNAseq_dataset_FB_reads_annotation.csv")
+
+for (i in c(2:ncol(df_names))) {
+  colnames(df)[colnames(df) == colnames(df_names)[i]] <- df_names[i] }
+
+
+# Grab duplicate values. 
+n_occur <- data.frame(table(df$ensembl_gene_id))
+n_occur <- n_occur[n_occur$Freq > 1,]
+
+# Grab place the indices in a list and sort it.
+ind <- c(1:sum(n_occur$Freq))
+count <- 1
+for (e in n_occur$Var1) {
+  for (i in which(df$ensembl_gene_id == e))
+  {
+    ind[count] <- i
+    count <- count + 1
+  } }
+ind <- sort(ind, decreasing=TRUE)
+
+
+# Remove the larger of the each duplicate pair.
+count <- 1
+for (i in ind)
+{
+  if (count%%2 != 0) { 
+    df <- df[-ind[count],] 
+    df_ogp <- df_ogp[-ind[count],] 
+    df_ogf <- df_ogf[-ind[count],] 
+    ORIGINAL_DATASET <- ORIGINAL_DATASET[-ind[count],] 
+    }
+  count <- count + 1
+}
+
+# Embed the the gene id into the row names.
+cts <- df[,-1]
+rownames(cts) <- df$ensembl_gene_id
+
+# Generate the column data variable.
+coldata <- t_pose(cts[1,])
+coldata[,1] = factor(rep(c("U","T"),each=3)) # Toggle untreated or treated.
+coldata[,2] = factor(rep(c(1,2,3),each=1))
+coldata[,3] = factor(rep(c("A","B","C"),each=6))
+coldata[,4] = factor("paired-end") # List as "single-read".
+colnames(coldata) <- c("cnd", "run", "exp", "type")
+
+# Transpose and reset the datatypes back to numeric.
+df <- t_pose(cts)
+# colnames(df) <- rownames(cts)
+# i <- c(1:ncol(df))
+# df[ , i] <- apply(df[ , i], 2, function(x) as.numeric(x))
+
+# Clean the variable work-space.
+rm(n_occur, ind, count, e)
+rm(df_t, df_names, i)
+
+```
+
+``` {r, echo=TRUE} 
+# Show portion of the dataframe.
+
+print(cts[1:4,])
+print(coldata)
+all(rownames(coldata) == colnames(cts))
+
+print(df[,1:3])
+
+```
+
+``` {r} 
+# Check for any missing values.
+
+print(paste("Number of missing values:", sum(is.na(df))))
+print(paste("Number of genes with negative values:", ncol(df[colSums(df < 0) > 0])))
+
+```
+
+# Reproducing the Original Data
+
+``` {r} 
+# DESeq2 shenanigans.
+
+# This section has code that works.
+dds_a <- DESeqDataSetFromMatrix(countData = cts[,1:6], colData = coldata[1:6,], design = ~cnd)
+dds_b <- DESeqDataSetFromMatrix(countData = cts[,7:12], colData = coldata[7:12,], design = ~cnd) 
+dds_c <- DESeqDataSetFromMatrix(countData = cts[,13:18], colData = coldata[13:18,], design = ~cnd)
+
+dds_a <- DESeq(dds_a)
+dds_b <- DESeq(dds_b)
+dds_c <- DESeq(dds_c)
+
+# 331
+# dds_a <- DESeq(dds_a, fitType="parametric", sfType="ratio")
+# dds_b <- DESeq(dds_b, fitType="parametric", sfType="ratio")
+# dds_c <- DESeq(dds_c, fitType="parametric", sfType="ratio")
+
+# 874
+# dds_a <- DESeq(dds_a, fitType="local", sfType="ratio")
+# dds_b <- DESeq(dds_b, fitType="local", sfType="ratio")
+# dds_c <- DESeq(dds_c, fitType="local", sfType="ratio")
+
+# 306
+# dds_a <- DESeq(dds_a, fitType="mean", sfType="ratio")
+# dds_b <- DESeq(dds_b, fitType="mean", sfType="ratio")
+# dds_c <- DESeq(dds_c, fitType="mean", sfType="ratio")
+
+# 558
+# dds_a <- DESeq(dds_a, fitType="parametric", sfType="poscounts")
+# dds_b <- DESeq(dds_b, fitType="parametric", sfType="poscounts")
+# dds_c <- DESeq(dds_c, fitType="parametric", sfType="poscounts")
+
+# 632
+# dds_a <- DESeq(dds_a, fitType="local", sfType="poscounts")
+# dds_b <- DESeq(dds_b, fitType="local", sfType="poscounts")
+# dds_c <- DESeq(dds_c, fitType="local", sfType="poscounts")
+
+# 692
+# dds_a <- DESeq(dds_a, fitType="mean", sfType="poscounts")
+# dds_b <- DESeq(dds_b, fitType="mean", sfType="poscounts")
+# dds_c <- DESeq(dds_c, fitType="mean", sfType="poscounts")
+
+# 251
+# dds_a <- DESeq(dds_a, fitType="parametric", sfType="iterate")
+# dds_b <- DESeq(dds_b, fitType="parametric", sfType="iterate")
+# dds_c <- DESeq(dds_c, fitType="parametric", sfType="iterate")
+
+# 219
+# dds_a <- DESeq(dds_a, fitType="local", sfType="iterate")
+# dds_b <- DESeq(dds_b, fitType="local", sfType="iterate")
+# dds_c <- DESeq(dds_c, fitType="local", sfType="iterate")
+
+# 115, the lowest.
+# dds_a <- DESeq(dds_a, fitType="mean", sfType="iterate")
+# dds_b <- DESeq(dds_b, fitType="mean", sfType="iterate")
+# dds_c <- DESeq(dds_c, fitType="mean", sfType="iterate")
+
+res_a <- results(dds_a, alpha=0.05)
+res_b <- results(dds_b, alpha=0.05)
+res_c <- results(dds_c, alpha=0.05)
+
+```
+
+
+``` {r} 
+# Reconstruct the original dataframe as closely as possible.
+
+# Replicate the statistics that came with the dataframe originally.
+df_rep <- data.frame(ensembl_gene_id=c(1:length(colnames(df))))
+df_rep <- t_pose(df_rep)
+
+# Generate the mean rows and calculate their values.
+df_rep[nrow(df_rep) + 1,] <- rowMeans(matrix(as.numeric(unlist(df[c(1:3),])), ncol(df),3, byrow=TRUE))
+row.names(df_rep)[nrow(df_rep)] <- "AC_mean"
+df_rep[nrow(df_rep) + 1,] <- rowMeans(matrix(as.numeric(unlist(df[c(4:6),])), ncol(df),3, byrow=TRUE))
+row.names(df_rep)[nrow(df_rep)] <- "AT_mean"
+df_rep[nrow(df_rep) + 1,] <- rowMeans(matrix(as.numeric(unlist(df[c(7:9),])), ncol(df),3, byrow=TRUE))
+row.names(df_rep)[nrow(df_rep)] <- "BC_mean"
+df_rep[nrow(df_rep) + 1,] <- rowMeans(matrix(as.numeric(unlist(df[c(10:12),])), ncol(df),3, byrow=TRUE))
+row.names(df_rep)[nrow(df_rep)] <- "BT_mean"
+df_rep[nrow(df_rep) + 1,] <- rowMeans(matrix(as.numeric(unlist(df[c(13:15),])), ncol(df),3, byrow=TRUE))
+row.names(df_rep)[nrow(df_rep)] <- "CC_mean"
+df_rep[nrow(df_rep) + 1,] <- rowMeans(matrix(as.numeric(unlist(df[c(16:18),])), ncol(df),3, byrow=TRUE))
+row.names(df_rep)[nrow(df_rep)] <- "CT_mean"
+
+# Attatch the gene id.
+df_rep <- t_pose(df_rep)
+df_rep$ensembl_gene_id <- colnames(df)
+rownames(df_rep) <- df_rep$ensembl_gene_id 
+#df_rep <- add_column(df_rep, entrezid=FALSE, .after = "ensembl_gene_id")
+print(df_rep[1:3,])
+
+
+# Generate the fold changes and add their associated adjusted p-values.
+#df_rep <- add_column(df_rep, A_fc_OG=res_a$log2FoldChange, .after = "AT_mean")
+df_rep <- add_column(df_rep, A_fc=(res_a$log2FoldChange * (-1)), .after = "AT_mean")
+df_rep <- add_column(df_rep, B_fc=(res_b$log2FoldChange * (-1)), .after = "BT_mean")
+df_rep <- add_column(df_rep, C_fc=(res_c$log2FoldChange * (-1)), .after = "CT_mean")
+df_rep <- add_column(df_rep, A_log_fc=(res_a$log2FoldChange * (-1)), .after = "AT_mean")
+df_rep <- add_column(df_rep, B_log_fc=(res_b$log2FoldChange * (-1)), .after = "BT_mean")
+df_rep <- add_column(df_rep, C_log_fc=(res_c$log2FoldChange * (-1)), .after = "CT_mean")
+df_rep <- add_column(df_rep, A_padj=res_a$padj, .after = "A_fc")
+df_rep <- add_column(df_rep, B_padj=res_b$padj, .after = "B_fc")
+df_rep <- add_column(df_rep, C_padj=res_c$padj, .after = "C_fc")
+
+print(paste("Number of missing values:", sum(is.na(df_rep))))
+df_rep$A_fc <- ifelse(is.na(df_rep$A_fc), 0, df_rep$A_fc)
+df_rep$B_fc <- ifelse(is.na(df_rep$B_fc), 0, df_rep$B_fc)
+df_rep$C_fc <- ifelse(is.na(df_rep$C_fc), 0, df_rep$C_fc)
+
+print(paste("Number of missing values:", sum(is.na(df_rep))))
+print(paste("Number of missing values:", sum(is.na(df_rep$A_fc_OG))))
+
+# Set up boolean columns. 
+df_rep <- add_column(df_rep, Sig_in_A = FALSE)
+df_rep <- add_column(df_rep, Sig_in_B = FALSE)
+df_rep <- add_column(df_rep, Sig_in_C = FALSE)
+df_rep <- add_column(df_rep, is_sig = FALSE)
+df_rep <- add_column(df_rep, na_padj = FALSE)
+
+df_rep <- add_column(df_rep, upreg.a = FALSE)
+df_rep <- add_column(df_rep, upreg.b = FALSE)
+df_rep <- add_column(df_rep, upreg.c = FALSE)
+df_rep <- add_column(df_rep, upreg = FALSE)
+df_rep <- add_column(df_rep, downreg.a = FALSE)
+df_rep <- add_column(df_rep, downreg.b = FALSE)
+df_rep <- add_column(df_rep, downreg.c = FALSE)
+df_rep <- add_column(df_rep, downreg = FALSE)
+
+alpha = 0.05
+fc_cutoff = 1.5
+
+print(df_rep)
+
+# Go through all the genes and alter the values as needed.
+for (i in c(1:dim(df_rep)[1]))
+{
+  # Adjust the fold change values out of log2 form.
+  for (c in c(which(colnames(df_rep)=="A_fc"), which(colnames(df_rep)=="B_fc"), which(colnames(df_rep)=="C_fc")))
+  {
+    ele <- df_rep[i,c]
+    
+    # Catch the NA values.
+    if (is.na(ele)){
+      print(paste("ISSUE: NA PRESENT AT INDEX", i, "--")) }
+
+    # Should the fold change be negative.
+    else if(ele < 0)  {
+      df_rep[i,c] <- -(2^(-ele)) }
+
+    # For the default, simple, case.
+    else {
+      df_rep[i,c] <- 2^ele }
+    
+    # # Flip the sign so the fold change is about increase rather than decrease.
+    # df_rep[i,c] <- -df_rep[i,c]
+  }
+
+  # Toggle whether each gene is above alpha (0.05)/ fold change (1.5).
+  if (sum(is.na(c(df_rep$A_padj[i], df_rep$B_padj[i], df_rep$C_padj[i]))) == 0)
+  {
+    if (df_rep$A_padj[i] <= alpha){
+      if (abs(df_rep$A_fc[i]) >= fc_cutoff){
+        df_rep$Sig_in_A[i] <- TRUE
+        df_rep$is_sig[i] <- TRUE  
+        if (df_rep$A_fc[i] > 0)  df_rep$upreg.a[i] <- TRUE else df_rep$downreg.a[i] <- TRUE
+        }}
+    
+    if (df_rep$B_padj[i] <= alpha){
+      if (abs(df_rep$B_fc[i]) >= fc_cutoff){
+        df_rep$Sig_in_B[i] <- TRUE
+        df_rep$is_sig[i] <- TRUE 
+        if (df_rep$B_fc[i] > 0)  df_rep$upreg.b[i] <- TRUE else df_rep$downreg.b[i] <- TRUE
+        }}
+  
+    if (df_rep$C_padj[i] <= alpha){
+      if (abs(df_rep$C_fc[i]) >= fc_cutoff){
+        df_rep$Sig_in_C[i] <- TRUE
+        df_rep$is_sig[i] <- TRUE 
+        if (df_rep$C_fc[i] > 0)  df_rep$upreg.c[i] <- TRUE else df_rep$downreg.c[i] <- TRUE
+        }}
+  }
+  else { 
+    df_rep$na_padj[i] <- TRUE   }
+  
+  # Toggle up and down regulated genes overall for apoptosis and CICD.
+  if (df_rep$upreg.a[i]   & df_rep$upreg.c[i])   df_rep$upreg[i] <- TRUE 
+  if (df_rep$downreg.a[i] & df_rep$downreg.c[i]) df_rep$downreg[i] <- TRUE 
+}
+
+print(paste("Number of significant changes in A:", sum(df_rep$Sig_in_A)))
+print(paste("Number of significant changes in B:", sum(df_rep$Sig_in_B)))
+print(paste("Number of significant changes in C:", sum(df_rep$Sig_in_C)))
+
+print(paste("Number of null entries:", sum(df_rep$na_padj)))
+print(paste("nulls absent in A:", sum(df_rep[!df_rep$na_padj,]$A_padj)>0))
+print(paste("nulls absent in B:", sum(df_rep[!df_rep$na_padj,]$B_padj)>0))
+print(paste("nulls absent in C:", sum(df_rep[!df_rep$na_padj,]$C_padj)>0))
+
+print(df_rep)
+
+```
+
+``` {r}
+
+# Produce a (scatter) graph between p-values of the original data and the replicated data.
+df_plot <- df_rep[,c(which(colnames(df_rep)=="A_padj"), which(colnames(df_rep)=="B_padj"), which(colnames(df_rep)=="C_padj"))]
+
+for (c in colnames(df_ogp))
+{
+  df_plot <- add_column(df_plot, c=df_ogp[[c]])
+  colnames(df_plot)[ncol(df_plot)] <- c
+}
+
+colnames(df_plot) <- c("A (replicated)", "B (replicated)", "C (replicated)", "A (Original)", "B (Original)", "C (Original)")
+setDT(df_plot)
+df_plot <- melt(data=df_plot, measure.vars=colnames(df_plot), variable.name="sample", value.name="padj") 
+r <- sum(table(df_plot$sample))/18
+df_plot$exp <- factor(rep(c("Apoptosis","BAXBAK","CICD"), each=r*3, times=2))
+
+print(df_plot)
+#print(df_ogp)
+
+# Boxplots with the full data.
+ggplot(df_plot, aes(x=sample, y=padj, fill=exp)) +
+  geom_boxplot() +
+  theme(panel.grid.major=element_blank(), panel.grid.minor=element_blank(),
+  panel.background=element_blank()) +
+  labs(title = "Spread of Adjusted P-values on the Full Dataset") +
+  xlab("Experiment Sample") +
+  ylab("Adjusted P-values") +
+  geom_jitter(width=0.1,alpha=0.01) #+ coord_cartesian(ylim=c(0,0.1))
+
+# ggplot(df_plot[df_plot$padj <= 1], aes(x=sample, y=padj, fill=exp)) +
+#   geom_boxplot() +
+#   theme(panel.grid.major=element_blank(), panel.grid.minor=element_blank(),
+#   panel.background=element_blank()) +
+#   labs(title = "Spread of Adjusted P-values where padj<=1") +
+#   xlab("Experiment Sample") +
+#   ylab("Adjusted P-values") +
+#   geom_jitter(width=0.1,alpha=0.01)
+
+# ggplot(df_plot[df_plot$padj < 0.9999], aes(x=sample, y=padj, fill=exp)) +
+#   geom_boxplot() +
+#   theme(panel.grid.major=element_blank(), panel.grid.minor=element_blank(),
+#   panel.background=element_blank()) +
+#   labs(title = "Spread of Adjusted P-values where padj<0.9999") +
+#   xlab("Experiment Sample") +
+#   ylab("Adjusted P-values") +
+#   geom_jitter(width=0.1,alpha=0.01)
+  
+
+```
+
+```{r}
+
+# Make new dataframe of both p values and fold changes.
+df_conc <- data.frame(fc1=df_ogf[,1], fc2=df_ogf[,2], fc3=df_ogf[,3], pa1=df_ogp[,1], pa2=df_ogp[,2], pa3=df_ogp[,3])
+# Drop the na rows.
+df_conc <- df_conc[complete.cases(df_conc),]
+
+# Make the graph for the original data..
+fc_vec_o <- unlist(c(df_conc[,1], df_conc[,2], df_conc[,3]))
+pa_vec_o <- unlist(c(df_conc[,4], df_conc[,5], df_conc[,6]))
+
+plot(fc_vec_o, pa_vec_o,
+     xlab="Fold Change", ylab="Adjusted P-value", xlim=c(-5,80),
+     #xlim=c(0,max(fc_vec)), ylim=c(0,max(pa_vec)),
+     main= paste("(Original) Correlation of ", as.character(round(cor(fc_vec_o, pa_vec_o,  method="pearson"), digits=2))))
+
+
+# Make the graph for the replicated data.
+df_conc <- data.frame(fc1=df_rep$A_fc, fc2=df_rep$B_fc, fc3=df_rep$C_fc, pa1=df_rep$A_padj, pa2=df_rep$B_padj, pa3=df_rep$C_padj)
+df_conc <- df_conc[complete.cases(df_conc),]
+
+fc_vec_r <- unlist(c(df_conc[,1], df_conc[,2], df_conc[,3]))
+pa_vec_r <- unlist(c(df_conc[,4], df_conc[,5], df_conc[,6]))
+# fc_vec_r <- c(df_rep$A_fc, df_rep$B_fc, df_rep$C_fc)
+# pa_vec_r <- c(df_rep$A_padj, df_rep$B_padj, df_rep$C_padj)
+
+plot(fc_vec_r, pa_vec_r,
+     xlab="Fold Change", ylab="Adjusted P-value", xlim=c(-5,80),
+     #xlim=c(0,max(fc_vec)), ylim=c(0,max(pa_vec)),
+     main= paste("(Replicated) Correlation of ", as.character(round(cor(fc_vec_r, pa_vec_r,  method="pearson"), digits=2))))
+
+```
+
+```{r}
+
+df_conc[(df_conc$fc1 < (-5)),]
+df_conc[(df_conc$fc2 < (-5)),]
+df_conc[(df_conc$fc3 < (-5)),]
+
+```
+
+
+
+```{r}
+
+df_conc <- data.frame(fc1=df_ogf[,1], fc2=df_ogf[,2], fc3=df_ogf[,3], pa1=df_rep$A_fc, pa2=df_rep$B_fc, pa3=df_rep$C_fc)
+df_conc <- df_conc[complete.cases(df_conc),]
+
+fc_vec_ot <- unlist(c(df_conc[,1], df_conc[,2], df_conc[,3]))
+fc_vec_rt <- unlist(c(df_conc[,4], df_conc[,5], df_conc[,6]))
+
+df_conc <- data.frame(fc1=df_rep$A_padj, fc2=df_rep$B_padj, fc3=df_rep$C_padj, pa1=df_ogp[,1], pa2=df_ogp[,2], pa3=df_ogp[,3])
+df_conc <- df_conc[complete.cases(df_conc),]
+
+pa_vec_ot <- unlist(c(df_conc[,1], df_conc[,2], df_conc[,3]))
+pa_vec_rt <- unlist(c(df_conc[,4], df_conc[,5], df_conc[,6]))
+
+plot(log2(fc_vec_rt), log2(fc_vec_ot),
+     xlab="Original", ylab="Replicated",
+     #xlim=c(0,max(fc_vec)), ylim=c(0,max(pa_vec)),
+     main= paste("log2(Fold Change) Correlation of ", as.character(round(cor(fc_vec_rt, fc_vec_ot,  method="pearson"), digits=2))))
+
+plot(pa_vec_ot, pa_vec_rt,
+     xlab="Original", ylab="Replicated",
+     #xlim=c(0,max(fc_vec)), ylim=c(0,max(pa_vec)),
+     main= paste("(Adjusted P-values) Correlation of ", as.character(round(cor(pa_vec_rt, pa_vec_ot,  method="pearson"), digits=2))))
+
+```
+
+
+```{r}
+
+# plot(df_rep$A_fc, df_rep$A_padj,
+#      xlab="Fold Change", ylab="Adjusted P-value",
+#      #xlim=c(0,max(fc_vec)), ylim=c(0,max(pa_vec)),
+#      main= paste("(Apoptosis) Correlation of ", as.character(round(cor(df_rep$A_fc, df_rep$A_padj,  method="pearson"), digits=2))))
+# 
+# plot(df_rep$B_fc, df_rep$B_padj,
+#      xlab="Fold Change", ylab="Adjusted P-value",
+#      #xlim=c(0,max(fc_vec)), ylim=c(0,max(pa_vec)),
+#      main= paste("(BAXBAK) Correlation of ", as.character(round(cor(df_rep$B_fc, df_rep$B_padj,  method="pearson"), digits=2))))
+# 
+# plot(df_rep$C_fc, df_rep$C_padj,
+#      xlab="Fold Change", ylab="Adjusted P-value",
+#      #xlim=c(0,max(fc_vec)), ylim=c(0,max(pa_vec)),
+#      main= paste("(CICD) Correlation of ", as.character(round(cor(df_rep$C_fc, df_rep$C_padj,  method="pearson"), digits=2))))
+
+
+# Looking at the ge spread of padj filled entries.
+
+# print("Apoptosis--")
+# print(mean(df_rep$A_fc[df_rep$A_padj == 1.5]))
+# print(sd(df_rep$A_fc[df_rep$A_padj == 1.5]))
+# print(max(df_rep$A_fc[df_rep$A_padj == 1.5]))
+# print(min(df_rep$A_fc[df_rep$A_padj == 1.5]))
+# print("BAXBAK--")
+# print(mean(df_rep$B_fc[df_rep$B_padj == 1.5]))
+# print(sd(df_rep$B_fc[df_rep$B_padj == 1.5]))
+# print(max(df_rep$B_fc[df_rep$B_padj == 1.5]))
+# print(min(df_rep$B_fc[df_rep$B_padj == 1.5]))
+# print("CICD--")
+# print(mean(df_rep$C_fc[df_rep$C_padj == 1.5]))
+# print(sd(df_rep$C_fc[df_rep$C_padj == 1.5]))
+# print(max(df_rep$C_fc[df_rep$C_padj == 1.5]))
+# print(min(df_rep$C_fc[df_rep$C_padj == 1.5]))
+
+```
+
+
+```{r}
+temp <- 0
+print(paste("Percentage of Original:", sum(fc_vec_o > temp)*100/length(fc_vec_o)))
+print(paste("Percentage of Replica: ", sum(fc_vec_r > temp)*100/length(fc_vec_r)))
+print(paste("Min value of Original padjs:", min(pa_vec_o)))
+print(paste("Min value of Replica padjs: ", min(pa_vec_r)))
+print(paste("Number of Original fc entries:", length(fc_vec_o)))
+print(paste("Number of Replica fc entries: ", length(fc_vec_r)))
+print(paste("Percentage of Original padj below 0.10:", sum(pa_vec_o < 0.10)*100/length(pa_vec_o[pa_vec_o<0.95])))
+print(paste("Percentage of Replica padj below 0.10: ", sum(pa_vec_r < 0.10)*100/length(pa_vec_r[pa_vec_r<0.95])))
+print(paste("Percentage of Original padj below 0.05:", sum(pa_vec_o < 0.05)*100/length(pa_vec_o[pa_vec_o<0.95])))
+print(paste("Percentage of Replica padj below 0.05: ", sum(pa_vec_r < 0.05)*100/length(pa_vec_r[pa_vec_r<0.95])))
+print(paste("Percentage of Original padj equal to 1:", sum(pa_vec_o == 1)*100/length(pa_vec_o)))
+print(paste("Percentage of Replica padj equal to 1: ", sum(pa_vec_r == 1)*100/length(pa_vec_r)))
+print(paste("Percentage of Original padj above 0.99:", sum(pa_vec_o > 0.99)*100/length(pa_vec_o)))
+print(paste("Percentage of Replica padj above 0.99: ", sum(pa_vec_r > 0.99)*100/length(pa_vec_r)))
+print(paste("Percentage of Original padj above 0.95:", sum(pa_vec_o > 0.95)*100/length(pa_vec_o)))
+print(paste("Percentage of Replica padj above 0.95: ", sum(pa_vec_r > 0.95)*100/length(pa_vec_r)))
+print(paste("Percentage of Original padj above 0.90:", sum(pa_vec_o > 0.90)*100/length(pa_vec_o)))
+print(paste("Percentage of Replica padj above 0.90: ", sum(pa_vec_r > 0.90)*100/length(pa_vec_r)))
+print(paste("Sum of Original padj below 0.05:", sum(pa_vec_o < 0.05)))
+print(paste("Sum of Replica padj below 0.05: ", sum(pa_vec_r < 0.05)))
+
+hist(pa_vec_o[pa_vec_o<1], xlab="Adjusted P-value", ylim=c(0,14000), main=paste("Spread of Original Padj-Values (", length(pa_vec_o[pa_vec_o<1]), ")" ))
+hist(pa_vec_r[pa_vec_r<1], xlab="Adjusted P-value", ylim=c(0,14000), main=paste("Spread of Replicated Padj-Values (", length(pa_vec_r[pa_vec_r<1]), ")" ))
+
+boundary <-0.999792217
+hist(pa_vec_o[pa_vec_o<=boundary], xlab="Adjusted P-value", ylim=c(0,12000), main=paste("Spread of Original Padj-Values (", length(pa_vec_o[pa_vec_o<boundary]), ")" ))
+hist(pa_vec_r[pa_vec_r<=boundary], xlab="Adjusted P-value", ylim=c(0,12000), main=paste("Spread of Replicated Padj-Values (", length(pa_vec_r[pa_vec_r<boundary]), ")" ))
+
+```
+
+```{r}
+
+hist(-log2(pa_vec_o[pa_vec_o<=1]), xlab="Adjusted P-value")
+hist((pa_vec_o[pa_vec_o<=0.1]), xlab="Adjusted P-value", ylim=c(0,7000))
+hist((pa_vec_r[pa_vec_r<=0.1]), xlab="Adjusted P-value", ylim=c(0,7000))
+
+```
+
+```{r}
+# Find whether the significant genes are overlapping.
+
+# Arrange the genes that are significant in the original data.
+ORIGINAL_DATASET$is_sig <- FALSE
+ORIGINAL_DATASET[!is.na(ORIGINAL_DATASET$`Sig in B`),]$is_sig <- TRUE
+ORIGINAL_DATASET[!is.na(ORIGINAL_DATASET$`Sig in C`),]$is_sig <- TRUE
+ORIGINAL_DATASET[!is.na(ORIGINAL_DATASET$`Sig in E`),]$is_sig <- TRUE
+
+df_venns <- Venn(list(
+  rep_A = df_rep[df_rep$Sig_in_A,]$ensembl_gene_id,
+  rep_B = df_rep[df_rep$Sig_in_B,]$ensembl_gene_id,
+  rep_C = df_rep[df_rep$Sig_in_C,]$ensembl_gene_id,
+  rep_all_sig = df_rep[df_rep$is_sig,]$ensembl_gene_id,
+  
+  org_A = ORIGINAL_DATASET[!is.na(ORIGINAL_DATASET$`Sig in E`),]$ensembl_gene_id,
+  org_B = ORIGINAL_DATASET[!is.na(ORIGINAL_DATASET$`Sig in B`),]$ensembl_gene_id,
+  org_C = ORIGINAL_DATASET[!is.na(ORIGINAL_DATASET$`Sig in C`),]$ensembl_gene_id,
+  org_all_sig = ORIGINAL_DATASET[ORIGINAL_DATASET$is_sig,]$ensembl_gene_id))
+
+```
+
+```{r}
+
+# Overlaps between the original data's significance.
+ggvenn(df_venns, slice = c(5,8))
+ggvenn(df_venns, slice = c(6,8))
+ggvenn(df_venns, slice = c(7,8))
+ggvenn(df_venns, slice = c(5,7))
+
+```
+
+```{r}
+
+# Overlaps between the replicated data's significance.
+ggvenn(df_venns, slice = c(1,4))
+ggvenn(df_venns, slice = c(2,4))
+ggvenn(df_venns, slice = c(3,4))
+ggvenn(df_venns, slice = c(1,3))
+
+```
+
+```{r}
+
+# Overlaps between the two dataset's significance.
+ggvenn(df_venns, slice = c(1,5))
+ggvenn(df_venns, slice = c(2,6))
+ggvenn(df_venns, slice = c(3,7))
+ggvenn(df_venns, slice = c(4,8))
+
+```
+
+
+# Exploring the Data
+
+``` {r} 
+
+# Scatter graph between gene's mean and std.
+# Look for the overall trends.
+
+#gene_means <- c(rowMeans(matrix(as.numeric(unlist(df[c(2:19),])), ncol(df),18, byrow=TRUE)))
+#gene_stds <- c(rowSds(matrix(as.numeric(unlist(df[c(2:19),])), ncol(df),18, byrow=TRUE)))
+#print(paste("The correlation between the means and standard deviations is:", cor(gene_means, gene_stds,  method="pearson")))
+
+gene_means <- colMeans(df)
+gene_stds <- sapply(df, sd)
+
+plot(gene_means, gene_stds,
+     xlab="Genes' mean expression", ylab="Genes' expression standard deviations",
+     xlim=c(0,max(gene_means)), ylim=c(0,max(gene_stds)),
+     main= paste("Correlation of ", as.character(round(cor(gene_means, gene_stds,  method="pearson"), digits=2))))
+
+```
+
+```{r}
+
+# Clustering the fold change. 
+# Straight up stolen from here idgaf rn: https://www.statmethods.net/advstats/cluster.html
+
+# Prepare Data
+mydata <- na.omit(c(df_rep$A_fc)) # listwise deletion of missing
+mydata <- scale(mydata) # standardize variables 
+
+# K-Means Cluster Analysis
+fit <- kmeans(mydata, 5) # 5 cluster solution
+# get cluster means
+aggregate(mydata,by=list(fit$cluster),FUN=mean)
+# append cluster assignment
+mydata <- data.frame(mydata, fit$cluster) 
+
+```
+
+```{r}
+
+# Prepare Data
+mydata <- na.omit(c(df_rep$C_fc)) # listwise deletion of missing
+mydata <- scale(mydata) # standardize variables 
+
+# K-Means Cluster Analysis
+fit <- kmeans(mydata, 5) # 5 cluster solution
+# get cluster means
+aggregate(mydata,by=list(fit$cluster),FUN=mean)
+# append cluster assignment
+mydata <- data.frame(mydata, fit$cluster) 
+
+```
+
+
+```{r}
+
+# Prepare Data
+mydata <- na.omit(c(df_rep$A_fc, df_rep$C_fc)) # listwise deletion of missing
+mydata <- scale(mydata) # standardize variables
+
+# K-Means Cluster Analysis
+fit <- kmeans(mydata, 5) # 5 cluster solution
+# get cluster means
+aggregate(mydata,by=list(fit$cluster),FUN=mean)
+# append cluster assignment
+mydata <- data.frame(mydata, fit$cluster)
+
+```
+
+``` {r, echo=TRUE} 
+# Generate a variable for the relevant subset of the dataframe.
+
+# Per experiment.
+mdf <- df[c(1:18),]
+mdf <- t_pose(mdf)
+colnames(mdf)[1:3] <- "AC"
+colnames(mdf)[4:6] <- "AT"
+colnames(mdf)[7:9] <- "BC"
+colnames(mdf)[10:12] <- "BT"
+colnames(mdf)[13:15] <- "CC"
+colnames(mdf)[16:18] <- "CT"
+
+setDT(mdf)
+mdf[1:5,]
+
+# Tidy/melt the dataframe for gg2plot to use.
+mdata_e <- melt(data=mdf, measure.vars=colnames(mdf), variable.name="sample", value.name="ge") 
+table(mdata_e$sample)
+
+# Log_2 transform for plotting visibility
+mdata_e$log2ge <- log2(mdata_e$ge)
+r <- sum(table(mdata_e$sample))/18
+mdata_e$exp <- factor(rep(c("Apoptosis","BAXBAK","CICD"), each=r*6, times=1))
+
+
+# Per sample.
+mdf <- df[c(1:18),]
+mdf <- t_pose(mdf)
+setDT(mdf)
+mdf[1:5,]
+
+# Tidy/melt the dataframe for gg2plot to use.
+mdata_s <- melt(data=mdf, measure.vars=colnames(mdf), variable.name="sample", value.name="ge") 
+table(mdata_s$sample)
+mdata_s$log2ge <- log2(mdata_s$ge)
+r <- sum(table(mdata_s$sample))/18
+mdata_s$exp <- factor(rep(c("AC", "AT","BC", "BT", "CC","CT"), each=r*3, times=1))
+mdata_s$group <- factor(rep(c("Apoptosis","BAXBAK","CICD"), each=r*6, times=1))
+
+# table(mdata_s[c(1:235074)]$sample)
+# table(mdata_s[c(235075:470148)]$sample)
+# table(mdata_s[c(470149:940296)]$sample)
+
+```
+
+``` {r}
+
+# Generate the boxplots for the sample's spread of values to check for normalisation.
+
+# Without cropping (sample with log2).
+ggplot(mdata_s, aes(x=sample, y=log2ge, fill=exp)) +
+  geom_boxplot() +
+  theme(panel.grid.major=element_blank(), panel.grid.minor=element_blank(),
+  panel.background=element_blank(), axis.ticks.x=element_blank(),
+        axis.text.x=element_blank()) +
+  labs(title = "Spread of Gene-expression by Sample") +
+  xlab("Experiment Sample") +
+  ylab("Log2 of the Gene-expression") +
+  geom_jitter(width=0.1,alpha=0.01) #+
+  #coord_cartesian(ylim=c(1,max(mdata_s$log2ge)))
+
+# Without cropping (experiment with log2).
+ggplot(mdata_e, aes(x=sample, y=log2ge, fill=exp)) +
+  geom_boxplot() +
+  theme(panel.grid.major=element_blank(), panel.grid.minor=element_blank(),
+  panel.background=element_blank()) +
+  labs(title = "Spread of Gene-expression by Experiment") +
+  xlab("Experiment Sample") +
+  ylab("Log2 of the Gene-expression") +
+  geom_jitter(width=0.1,alpha=0.01) #+
+
+```
+
+# Cleaning non-expressed Genes
+
+``` {r} 
+
+# Histograms of gene expression.
+sub_df = log2(unlist(as.list(t_pose(df[c(1:6,13:18),]))))
+
+boundary = -1
+hist(sub_df[sub_df > boundary], breaks=3000, xlab="Mean gene-expression per gene", main=paste("Histogram of values above:", boundary), sub=paste("(There are", sum(rowSums(t_pose(df[c(1:6,13:18),]) > boundary) > 0), "values in total)"))
+
+# boundary = -1
+# hist(sub_df[sub_df > boundary], breaks=3000, xlab="Mean gene-expression per gene", main=paste("Histogram of values above:", boundary), sub=paste("(There are", sum(rowSums(t_pose(df[c(1:6,13:18),]) > boundary) > 0), "values in total)"), xlim=c(0,10000))
+
+png(paste0("P1_outputs/log2_histogram_of_ge_above_100_ge.png"), width = 4.5, height = 4.5, units = 'in', res = 400)
+boundary = 10
+hist(sub_df[sub_df > log2(boundary)], breaks=3000, xlab="Gene-expression (Log2)", 
+     main=paste0("n = ", sum(rowSums(t_pose(df[c(1:6,13:18),]) > boundary) > 0)))
+dev.off()
+
+png(paste0("P1_outputs/log2_histogram_of_ge_above_500_ge.png"), width = 4.5, height = 4.5, units = 'in', res = 400)
+boundary = 500
+hist(sub_df[sub_df > log2(boundary)], breaks=3000, xlab="Gene-expression (Log2)", 
+     main=paste0("n = ", sum(rowSums(t_pose(df[c(1:6,13:18),]) > boundary) > 0)))
+dev.off()
+
+# 
+# boundary = log2(100)
+# hist(sub_df[sub_df > boundary], breaks=3000, xlab="Mean gene-expression per gene", main=paste("Histogram of values above:", boundary), sub=paste("(There are", sum(rowSums(t_pose(df[c(1:6,13:18),]) > boundary) > 0), "values in total)"))
+# 
+# boundary = log2(200)
+# hist(sub_df[sub_df > boundary], breaks=3000, xlab="Mean gene-expression per gene", main=paste("Histogram of values above:", boundary), sub=paste("(There are", sum(rowSums(t_pose(df[c(1:6,13:18),]) > boundary) > 0), "values in total)"))
+# 
+# boundary = log2(500)
+# hist(sub_df[sub_df > boundary], breaks=3000, xlab="Mean gene-expression per gene", main=paste("Histogram of values above:", boundary), sub=paste("(There are", sum(rowSums(t_pose(df[c(1:6,13:18),]) > boundary) > 0), "values in total)"))
+# 
+# boundary = log2(1000)
+# hist(sub_df[sub_df > boundary], breaks=3000, xlab="Mean gene-expression per gene", main=paste("Histogram of values above:", boundary), sub=paste("(There are", sum(rowSums(t_pose(df[c(1:6,13:18),]) > boundary) > 0), "values in total)"))
+
+# boundary = 3000
+# hist(sub_df[sub_df > boundary], breaks=3000, xlab="Mean gene-expression per gene", main=paste("Histogram of values above:", boundary), sub=paste("(There are", sum(rowSums(t_pose(df[c(1:6,13:18),]) > boundary) > 0), "values in total)"))
+# 
+# boundary = 4000
+# hist(sub_df[sub_df > boundary], breaks=3000, xlab="Mean gene-expression per gene", main=paste("Histogram of values above:", boundary), sub=paste("(There are", sum(rowSums(t_pose(df[c(1:6,13:18),]) > boundary) > 0), "values in total)"))
+# 
+# boundary = 5000
+# hist(sub_df[sub_df > boundary], breaks=3000, xlab="Mean gene-expression per gene", main=paste("Histogram of values above:", boundary), sub=paste("(There are", sum(rowSums(t_pose(df[c(1:6,13:18),]) > boundary) > 0), "values in total)"))
+
+# boundary = 10000
+# hist(sub_df[sub_df > boundary], xlab="Mean gene-expression per gene", main=paste("Histogram of values above:", boundary),
+#      sub=paste("(There are", sum(sub_df > boundary), "values in total)"))
+# 
+# boundary = 20000
+# hist(sub_df[sub_df > boundary], xlab="Mean gene-expression per gene", main=paste("Histogram of values above:", boundary),
+#      sub=paste("(There are", sum(sub_df > boundary), "values in total)"))
+# 
+# boundary = 25000
+# hist(sub_df[sub_df > boundary], xlab="Mean gene-expression per gene", main=paste("Histogram of values above:", boundary),
+#      sub=paste("(There are", sum(sub_df > boundary), "values in total)"))
+#      
+# boundary = 30000
+# hist(sub_df[sub_df > boundary], xlab="Mean gene-expression per gene", main=paste("Histogram of values above:", boundary),
+#      sub=paste("(There are", sum(sub_df > boundary), "values in total)"))
+     
+# boundary = 28000
+# hist(sub_df[sub_df > boundary], xlab="Mean gene-expression per gene", main=paste("Histogram of values above:", boundary))
+     
+```
+
+```{r}
+
+boundary.1  <- 10
+boundary.2  <- 500
+
+bin.amount <- 500
+df.t <- as.data.frame(sub_df[sub_df > log2(boundary.1)])
+x.min <- min(df.t$ge.values)
+x.max <- NULL
+
+colnames(df.t) <- c("ge.values")
+df.t$noise <- "Below 500"
+df.t[df.t$ge.values > log2(boundary.2), "noise"] <- "Above 500"
+# df.t[df.t$ge.values > log2(270), "noise"] <- "Above 500"
+df.t$noise <- factor(df.t$noise, unique(df.t$noise))
+
+n.1 <- sum(rowSums(t_pose(df[c(1:6,13:18),]) > boundary.1) > 0)
+n.2 <- sum(rowSums(t_pose(df[c(1:6,13:18),]) > boundary.2) > 0)
+
+
+png("P1_outputs/log_2 histograms of gene expression.png",
+                 width = 7, height = 5, units = 'in', res = 400)
+ggplot(df.t, aes(x=ge.values, fill=factor(noise))) + 
+            geom_histogram(bins=bin.amount) + 
+            # coord_cartesian(ylim = c(0, 1), xlim = c(0, 1)) +
+            expand_limits(x = x.min) +
+            labs(title="Frequency of Gene-expression Values", 
+                 subtitle=paste("n = [", n.1, ", ", n.2, "]"),
+                 x="Gene-expression after a Log2 transform", 
+                 y="Frequency") +
+            theme(#axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+                  # axis.title.x=element_blank(),
+                  legend.title=element_blank(),
+                  legend.position = "top", 
+                  # legend.position = "none", 
+                  plot.title = element_text(hjust = 0.5),
+                  plot.subtitle = element_text(hjust = 0.5))
+dev.off()
+
+# plot1 <- ggplot(df.t, aes(x=ge.values, fill=factor(noise))) + 
+#             geom_histogram(bins=bin.amount) + 
+#             # coord_cartesian(ylim = c(0, 1), xlim = c(0, 1)) +
+#             expand_limits(x = x.min) +
+#             labs(title=boundary, 
+#                  subtitle=paste("(There are", sum(rowSums(t_pose(df[c(1:6,13:18),]) > boundary) > 0), "genes in total)"),
+#                  x="Gene-expression after a Log2 transform", 
+#                  y="Frequency") +
+#              theme(legend.position = "none") 
+# 
+# df.t <- as.data.frame(sub_df[sub_df > log2(boundary.2)])
+# colnames(df.t) <- c("ge.values")
+# df.t$noise <- 0
+# plot2 <- ggplot(df.t, aes(x=ge.values, fill=factor(noise))) +
+#             geom_histogram(bins=bin.amount) +
+#             expand_limits(x = x.min) +
+#             labs(title=boundary,
+#                  subtitle=paste("(There are", sum(rowSums(t_pose(df[c(1:6,13:18),]) > boundary) > 0), "genes in total)"),
+#                  x="Gene-expression after a Log2 transform",
+#                  y="Frequency") +
+#             theme(legend.position = "none") 
+# 
+# 
+# if (save.it) png("P1_outputs/log_2 histograms of gene expression (double).png",
+#                  width = 7, height = 5, units = 'in', res = 400)
+# guide_area() + (plot1 + plot2) +
+#   plot_layout(guides = "collect", nrow = 2, heights = c(1,10)) +
+#   plot_annotation("Gene-expression values values above:") &
+#   theme(legend.position = "top",
+#         legend.box.margin=margin(0, 30, 10, 0),
+#         plot.title = element_text(hjust = 0.5),
+#         plot.subtitle = element_text(hjust = 0.5))
+# if (save.it) dev.off()
+
+# rm(plot1, plot2)
+
+```
+
+``` {r} 
+
+#Get rows with values above the cut-off point (play with), we want 8.000-10,000.
+cutoff = 500
+
+# Filter and generate truth values to see the entries that are relevant.
+mdata_n <- df[c(1:18),!df_rep$na_padj]
+keep <- colSums(mdata_n > cutoff) > 0
+print(sum(keep))
+mdata_n <- mdata_n[,keep]
+mdata_n <- t_pose(mdata_n)
+
+# Melting for plotting.
+setDT(mdata_n)
+mdata_n <- melt(data=mdata_n, measure.vars=colnames(mdata_n), variable.name="sample", value.name="ge") 
+mdata_n$log2ge <- log2(mdata_n$ge)
+r <- sum(table(mdata_n$sample))/18
+mdata_n$exp <- factor(rep(c("AC", "AT","BC", "BT", "CC","CT"), each=r*3, times=1))
+
+print(mdata_n)
+table(mdata_n$sample)
+
+# Show the boxplots of log2ge again.
+
+ggplot(mdata_n, aes(x=sample, y=ge, fill=exp)) +
+  geom_boxplot() +
+  theme(panel.grid.major=element_blank(), panel.grid.minor=element_blank(),
+  panel.background=element_blank(), axis.ticks.x=element_blank(),
+        axis.text.x=element_blank()) +
+  labs(title = paste("Spread of Gene-expression for Genes with any value above", cutoff)) +
+  xlab("Experiment Sample") +
+  ylab("Gene-expression") +
+  geom_jitter(width=0.1,alpha=0.01)
+
+ggplot(mdata_n, aes(x=sample, y=log2ge, fill=exp)) +
+  geom_boxplot() +
+  theme(panel.grid.major=element_blank(), panel.grid.minor=element_blank(),
+  panel.background=element_blank(), axis.ticks.x=element_blank(),
+        axis.text.x=element_blank()) +
+  labs(title = paste("Spread of Gene-expression for Genes with any value above", cutoff)) +
+  xlab("Experiment Sample") +
+  ylab("Log2 of the Gene-expression") +
+  geom_jitter(width=0.1,alpha=0.01)
+
+```
+
+``` {r} 
+
+# Filter and generate truth values to see the entries that are relevant.
+mdata_n <- df[c(1:18),!df_rep$na_padj]
+
+# Quantile normalisation.
+mdata_n <- t_pose(mdata_n)
+tempa <- colnames(mdata_n)
+tempb <- rownames(mdata_n)
+mdata_n <- data.frame(normalize.quantiles(data.matrix(mdata_n)))
+colnames(mdata_n) <- tempa
+rownames(mdata_n) <- tempb
+
+# Melt for plotting.
+setDT(mdata_n)
+mdata_n <- melt(data=mdata_n, measure.vars=colnames(mdata_n), variable.name="sample", value.name="ge") 
+mdata_n$log2ge <- log2(mdata_n$ge)
+
+table(mdata_n$sample)
+r <- sum(table(mdata_n$sample))/18
+mdata_n$exp <- factor(rep(c("AC", "AT","BC", "BT", "CC","CT"), each=r*3, times=1))
+print(mdata_n)
+
+
+# Show the boxplots of log2ge again.
+ggplot(mdata_n, aes(x=sample, y=ge, fill=exp)) +
+  geom_boxplot() +
+  theme(panel.grid.major=element_blank(), panel.grid.minor=element_blank(),
+  panel.background=element_blank(), axis.ticks.x=element_blank(),
+        axis.text.x=element_blank()) +
+  labs(title = "Spread of Quantile-normalised Gene-expression of the Full Dataset") +
+  xlab("Experiment Sample") +
+  ylab("Gene-expression") +
+  geom_jitter(width=0.1,alpha=0.01)
+
+ggplot(mdata_n, aes(x=sample, y=log2ge, fill=exp)) +
+  geom_boxplot() +
+  theme(panel.grid.major=element_blank(), panel.grid.minor=element_blank(),
+  panel.background=element_blank(), axis.ticks.x=element_blank(),
+        axis.text.x=element_blank()) +
+  labs(title = "Spread of Quantile-normalised Gene-expression of the Full Dataset") +
+  xlab("Experiment Sample") +
+  ylab("Log2 of the Gene-expression") +
+  geom_jitter(width=0.1,alpha=0.01)
+
+```
+
+```{r}
+
+r = sum(table(mdata_n$sample) == attributes(table(mdata_n$sample)[1]))
+print(r)
+print(attributes(table(mdata_n$sample)[1]))
+#print()
+
+```
+
+
+``` {r} 
+
+# Filter and generate truth values to see the entries that are relevant.
+mdata_n <- df[c(1:18),!df_rep$na_padj]
+keep <- colSums(mdata_n > cutoff) > 1
+print(sum(keep))
+mdata_n <- mdata_n[,keep]
+
+# Quantile normalisation.
+mdata_n <- t_pose(mdata_n)
+tempa <- colnames(mdata_n)
+tempb <- rownames(mdata_n)
+mdata_n <- data.frame(normalize.quantiles(data.matrix(mdata_n)))
+colnames(mdata_n) <- tempa
+rownames(mdata_n) <- tempb
+mdata_n_melt <- mdata_n
+
+# Melt for plotting.
+setDT(mdata_n_melt)
+mdata_n_melt <- melt(data=mdata_n_melt, measure.vars=colnames(mdata_n_melt), variable.name="sample", value.name="ge") 
+mdata_n_melt$log2ge <- log2(mdata_n_melt$ge)
+r <- sum(table(mdata_n_melt$sample))/18
+mdata_n_melt$exp <- factor(rep(c("AC", "AT","BC", "BT", "CC","CT"), each=r*3, times=1))
+
+print(mdata_n_melt)
+table(mdata_n_melt$sample)
+
+# Show the boxplots of log2ge again.
+ggplot(mdata_n_melt, aes(x=sample, y=ge, fill=exp)) +
+  geom_boxplot() +
+  theme(panel.grid.major=element_blank(), panel.grid.minor=element_blank(),
+  panel.background=element_blank(), axis.ticks.x=element_blank(),
+        axis.text.x=element_blank()) +
+  labs(title = paste("Quantile-normalised Gene-expression for Genes with any value above", cutoff)) +
+  xlab("Experiment Sample") +
+  ylab("Gene-expression") +
+  geom_jitter(width=0.1,alpha=0.01)
+
+ggplot(mdata_n_melt, aes(x=sample, y=log2ge, fill=exp)) +
+  geom_boxplot() +
+  theme(panel.grid.major=element_blank(), panel.grid.minor=element_blank(),
+  panel.background=element_blank(), axis.ticks.x=element_blank(),
+        axis.text.x=element_blank()) +
+  labs(title = paste("Quantile-normalised Gene-expression for Genes with any value above", cutoff)) +
+  xlab("Experiment Sample") +
+  ylab("Log2 of the Gene-expression") +
+  geom_jitter(width=0.1,alpha=0.01)
+
+```
+
+
+# PCA Anaylsis
+
+```{r}
+# sauce: https://cran.r-project.org/web/packages/ggfortify/vignettes/plot_pca.html
+
+# Re-update the quantile normalised, cropped data back to a data frame.
+setDF(mdata_n)
+colnames(mdata_n) <- tempa
+rownames(mdata_n) <- tempb
+
+
+# Transpose the dataframe to set the genes to be the variables.
+mdata_n <- t_pose(mdata_n)
+
+# Add this for visualisation purposes, remember to not include it in calculations.
+mdata_n$sample <- rownames(mdata_n)
+mdata_n$exp <- factor(rep(c("AC", "AT","BC", "BT", "CC","CT"), each=3, times=1))
+
+print(mdata_n[1:5,])
+
+```
+
+```{r}
+
+# Apply PCA with mean-centring the data to (0,0).
+mdata_n.pca <- prcomp(mdata_n[c(1:nrow(mdata_n)-1)], center = TRUE,scale. = FALSE)
+summary(mdata_n.pca)
+
+# Visualise the PCs.
+#ggbiplot(mdata_n.pca, labels=rownames(mdata_n))
+autoplot(mdata_n.pca, data=mdata_n, colour="sample")
+autoplot(mdata_n.pca, data=mdata_n, colour="exp", scale=0)
+#autoplot(mdata_n.pca, data=mdata_n, colour="exp", loadings=TRUE, loadings.colour='black', loadings.label=TRUE, loadings.label.size=3, scale=0)
+
+```
+
+
+# Exporting dataframes
+
+```{r}
+# Generate EntrezIDs from the ENSEMBLE gene ids and append to each dataframe.
+
+# Attach the corresponding entrez ids.
+names(df_rep)[names(df_rep) == "ensembl_gene_id"] <- "ENSEMBL"
+gene_ids <- bitr(df_rep$ENSEMBL, fromType = "ENSEMBL", toType = "ENTREZID", OrgDb = "org.Mm.eg.db")
+df_rep <- add_column(df_rep, ENTREZID=NA, .after = "ENSEMBL")
+
+for (i in 1:dim(df_rep)[1])
+{
+  temp <- match(df_rep$ENSEMBL[i], c(gene_ids$ENSEMBL))
+  if (length(temp) > 0) {
+    df_rep$ENTREZID[i] <- gene_ids$ENTREZID[temp] }
+}
+
+#C_log_fc=unlist(ORIGINAL_DATASET[,c("CICD FC")])
+
+```
+
+```{r}
+# Output the original and newly constructed padj values, without normalisation.
+
+# Check that the replicated dataframe is in fact ordered the same as the original, thus the constructed values aren't mismatched.
+if (identical(rownames(df_rep), colnames(df)))
+{
+  # Attach the raw samples to the df_rep dataframe.
+  df_rep_final <- cbind(df_rep, t_pose(df))
+  
+  # Save the output.
+  time_date <- paste0(Sys.Date(), "--", format(Sys.time(), "%H-%M-%S--"))
+  write.csv(df_rep_final, "P1_outputs/df_rep.csv", row.names = FALSE)
+  write.csv(df_rep_final, paste0("P1_outputs/archives/", time_date, "df_rep.csv"), row.names = FALSE)
+  
+} else {
+  print("Oops--")}
+
+```
+
+```{r}
+
+df_rep_final
+
+```
+
+## genelist exporting
+
+```{r}
+
+# if df_rep_final doesn't exist
+if(TRUE)
+{
+  # import it from saved file
+  df_rep_final <- read_csv("P1_outputs/df_rep.csv")
+}
+
+# Grab the relevant columns.
+temp.s <- which(colnames(df_rep_final) %in% "Sig_in_A")
+temp.f <- which(colnames(df_rep_final) %in% "downreg")
+df_rep <- df_rep_final[, c(which(colnames(df_rep_final) %in% "ENTREZID"), temp.s:temp.f)]
+df_rep <- df_rep[, -c(which(colnames(df_rep) %in% "Sig_in_B"), 
+                      which(colnames(df_rep) %in% "upreg.b"),
+                      which(colnames(df_rep) %in% "downreg.b"))]
+
+df_rep <- as.data.frame(df_rep)
+rownames(df_rep) <- df_rep_final$ENSEMBL
+df_rep
+
+```
+
+```{r}
+# Create corresponding dataframes where the Entrez ID is the pivotal value.
+# Stolen from P2_Enrichment.Rmd.
+
+# Grab indices for the duplicate.
+dup = data.frame(entrez=c(27366, 108143, 67118, 677884, 12050, 241303, 18861, 100503949, 100043915, 50518, 100303747, 257665, 75015, 71138, 545611, 108168524, 70896, 625210, 107723, 170942, 100039014), n=NA, i=NA, r=NA)
+
+for(j in 1:dim(dup)[1])
+{
+  # Assemble metadata
+  dup$i[j] <- list(which(df_rep$ENTREZID == dup$entrez[j])) # Duplicate indices.
+  dup$n[j] <- length(unlist(dup$i[j])) # Number of duplicate indices.
+  dup$r[j] <- list(dup$i[[j]][-1]) # Indices to be removed (everything but the first occurrence).
+                   
+  # View their varying values.
+  # print(df_rep[unlist(dup$i[j]), c(1:7,18)])
+  # print(df_rep[unlist(dup$i[j]), c(1:2,13:17,20)])
+}
+
+# Swap the "second is best" options around.
+j <- c(75015, 170942)
+for(k in j)
+{
+  k <- which(dup$entrez == k)
+  
+  # Sanity check.
+  if (dup$n[k] != 2){
+    print("ERROR WITH METHOD: LENGTH IS", dup$n[k]) }
+    
+  # Swap.
+  dup$i[k] <- list(unlist(rev(dup$i[[k]])))
+  dup$r[k] <- list(dup$i[[k]][-1])
+}
+
+# Eliminate the NA Entrez IDs and the duplicate entries.
+v <- unname(!colSums(is.na(t_pose(df_rep))) > 0)
+v[c(unlist(dup$r))] <- FALSE
+#v <- sort(v[c(unlist(dup$r))])
+
+
+df_rep_e <- df_rep[v, ] 
+rownames(df_rep_e) <- df_rep_e$ENTREZID
+#df_rep_e <- df_rep_e[, -c(which(colnames(df_rep_e) %in% "ENTREZID"))]
+print(df_rep_e)
+
+#rm(j, v)
+
+```
+
+```{r}
+# Export this dataframe.
+
+if (TRUE)
+{
+  write.csv(df_rep_e, "P1_outputs/df_rep_genelist.csv", row.names = FALSE)
+  write.csv(df_rep_e, paste0("P1_outputs/archives/", time_date, "df_rep_genelist.csv"), row.names = FALSE)
+}
+
+```
+
+
+
+

@@ -1,0 +1,4225 @@
+---
+title: "P2 Visualisation"
+author: "Olive Kirk"
+date: "14/12/2022"
+output: pdf_document
+---
+
+Visualisations of the enrichment analysis results. Separated from P2_Enrichment.Rmd.
+Exports enriched geneset overlap by database, recording the differences by dataset.
+Also handles the creation and examination of summary statistics and graph production.
+There are a large amount of unused graphs that are commented out to show that many angles were examined.
+
+Colours are curtesy of https://r-charts.com/colors/ and https://pmassicotte.github.io/paletteer_gallery/
+
+NOTE: in main() export loop, there are `if (FALSE)` and `if (TRUE)` for flexibility and time convenience.
+All should be `TRUE` when running for the first time.
+
+
+# Imports
+```{r include=FALSE} 
+# Import libraries.
+
+knitr::opts_chunk$set(echo = TRUE)
+
+# Core computational packages.
+library(stats)
+library(matrixStats)
+library(EnrichmentBrowser)
+library(rWikiPathways)
+library(made4)
+
+# Visualisation packages.
+library(ggplot2)
+library(ggfortify)
+library(patchwork)
+library(ComplexHeatmap)
+library(VennDiagram)
+library(paletteer)
+library(RColorBrewer)
+library(stringr)
+#library(factoextra)
+library(dendextend)
+#library(UpSetR)
+
+# Coding preference packages.
+library(readr)
+library(tibble)
+library(dplyr)
+library(data.table)
+library(futile.logger)
+
+
+set.seed(42)
+options("scipen"=10, "digits"=4)
+time_date <- paste0(Sys.Date(), "--", format(Sys.time(), "%H-%M-%S--"))
+dev.new(width=10, height=10, unit="in")
+col.scheme <- brewer.pal(3, "Pastel2")
+futile.logger::flog.threshold(futile.logger::ERROR, name = "VennDiagramLogger")
+
+
+# Set method and experiment naming titles.
+method.names <- c("ORA", "GSEA", "GSA", "PADOG", "MRGSE", 
+                  "CAMERAv1", "CAMERAv2", "ROAST", 
+                  "GLOBALTEST", "GSVA", "PLAGE")
+
+reg.list      <- c("mixed", "up_reg", "down_reg")
+database.list <- c("kegg", "go", "msigdb-h", "wikipathways", "reactome", "mousecyc")
+sep.v         <- ": "
+
+```
+
+```{r}
+
+# Define functions.
+
+# Transpose matrix and retain the name values.
+t_pose <- function(d) {
+  df_t <- transpose(d)
+  rownames(df_t) <- colnames(d)
+  colnames(df_t) <- rownames(d)
+  d <- df_t
+  
+  return(d)
+}
+
+```
+
+
+```{r}
+# List-i-fy the csv files.
+
+
+#' Generate a surrogate list from the csv files, allowing previous visualisation
+#' methods to run smoothly without needing to repeatedly generating the EA results.
+#'
+#' @param csv csv file containing the equivalent of sbea$res.tbl, the full list of genes and EA data.
+#' @param name Name of the enrichment method used.
+csv_to_eb_list <- function(csv, name, dataset){
+  
+  # Generate the sbea list.
+  res.tbl <- as.data.frame(csv)
+  nr.sigs <- sum(res.tbl$ADJ.PVAL < 0.05)
+  sbea.res <- list(res.tbl=res.tbl, nr.sigs=nr.sigs, alpha=0.05)
+  
+  # Generate the ranking list.
+  ranking.res <- gsRanking(sbea.res)
+  if (sbea.res$nr.sigs == 0) {
+    print("!! This method found ZERO significant genesets--") # else ranking.res
+  } else { 
+    sbea.res$res.tbl <- sbea.res$res.tbl[order(sbea.res$res.tbl$ADJ.PVAL, decreasing=FALSE),]
+    ranking.res <- ranking.res[order(ranking.res$ADJ.PVAL, decreasing=FALSE),]  
+  }
+  
+  # Return.
+  res <- list(sbea=sbea.res, ranking=ranking.res, metadata=list(method=name, dataset=dataset))
+  return(res)
+}
+
+```
+
+# Set up methods
+
+
+```{r}
+# Export list.
+
+export_list <- function(ls, file) {
+  
+  sink(file)
+  # for (i in ls) {
+  #   print(i)
+  # }
+  print(ls)
+  sink()
+}
+
+```
+
+```{r}
+# Match and rename names.
+
+rename_wp <- function(df, dict)
+{
+  for (i in 1:dim(df)[1]) df$GENE.SET[i] <- dict$name[which(dict$id %in% df$GENE.SET[i])]
+  return(df)
+}
+
+```
+
+## get methods
+
+```{r}
+
+#' Assign names to the list entries corresponding to the EA method.
+#'
+#' 
+#' @param gs List of EnrichmentBrowser style results compilation.
+#' @param dataset.names Boolean about whether to include "a" or "c" tags.
+set.names <- function(gs, dataset.names=FALSE)
+{
+  names(gs) <- vector(, length(gs))
+  for(i in 1:length(gs))
+  {
+    names(gs)[i] <- gs[[i]]$metadata$method
+    if (dataset.names)  names(gs)[i] <- paste0(gs[[i]]$metadata$dataset, ".", names(gs)[i])
+  }
+  
+  return(gs)
+}
+
+
+#' Assemble the significant genesets, is given sorted by q-value significance.
+#' Removes any entries that have no significant genesets from the return object.
+#' Defaults to returning the genesets sorted in descending order of significance.
+#' 
+#' @param gs List of EnrichmentBrowser style results compilation.
+#' @param sort Boolean if the list should be returned sorted alphabetically.
+#' @param drop Boolean if the empty gs entries should be removed from the return product.
+get.geneset <- function(gs, sort=FALSE, drop=TRUE)
+{
+  # For when handling set B that is set to NA.
+  if (sum(is.na(gs)) > 0) return(NA)
+  
+  l <- vector("list", length(gs))
+  for(i in 1:length(gs))
+  {
+    if (!is.null(gs[[i]]$ranking$GENE.SET))
+    {
+      l[i] <- list(unlist(gs[[i]]$ranking$GENE.SET))
+      names(l)[i] <- names(gs)[i]
+      if(sort==TRUE) l[i] <- sort(l[i]) 
+    }
+  }
+  if (drop==TRUE) l <- l[!sapply(l, is.null)] else names(l) <- names(gs)
+  #if (drop==FALSE) for (e in l[sapply(l, is.null)]) e <- vector()
+  
+  return(l)
+}
+
+#' Assemble the nonsignificant genesets, is given sorted by q-value significance.
+#' Defaults to returning the genesets sorted in descending order of significance.
+#' 
+#' @param gs List of EnrichmentBrowser style results compilation.
+#' @param sort Boolean if the list should be returned sorted alphabetically.
+get.deadset <- function(gs, sort=F)
+{
+  l <- vector("list", length(gs))
+  for(i in 1:length(gs))
+  {
+    a <- length(gs[[i]]$ranking$GENE.SET) + 1
+    b <- length(gs[[i]]$sbea$res.tbl$GENE.SET)
+    l[i] <- list(unlist(gs[[i]]$sbea$res.tbl$GENE.SET)[a:b])
+    names(l)[i] <- names(gs)[i]
+    if(sort==TRUE) l[i] <- sort(l[i])
+  }
+  
+  return(l)
+}
+
+
+#' Assembles the q-values after sorting by alphabetically geneset.
+#' 
+#' @param gs List of EnrichmentBrowser style results compilation.
+get.q.value <- function(gs)
+{
+  # For when handling set B that is set to NA.
+  if (sum(is.na(gs)) > 0) return(NA)
+  
+  l <- vector("list", length(gs))
+  for(i in 1:length(gs))
+  {
+    # Sort the data.
+    df <- as.data.frame(gs[[i]]$sbea$res.tbl)
+    df <- df[order(df$GENE.SET),]
+    
+    # Extract the key component.
+    l[i] <- list(df$ADJ.PVAL)
+    names(l)[i] <- names(gs)[i]
+  }
+  
+  return(l)
+}
+
+#' same as get.q.value except it returns the sorted list of all examined genesets.
+check.geneset <- function(gs, sort=FALSE, drop=FALSE)
+{
+  l <- vector("list", length(gs))
+  for(i in 1:length(gs))
+  {
+    # Sort the data.
+    df <- as.data.frame(gs[[i]]$sbea$res.tbl)
+    df <- df[order(df$GENE.SET),]
+    
+    # Extract the key component.
+    l[i] <- list(df$GENE.SET)
+    names(l)[i] <- names(gs)[i]
+  }
+  
+  return(l)
+}
+
+```
+
+## heatmap
+
+```{r}
+
+#' Method to get the number of shared genesets between the results of different EA methods.
+#' 
+#' Correlation matrix specific arguments: 
+#'  corr, 
+#'  logt
+#'  pval.
+#'  
+#'  Overlap specific arguments: 
+#'  cutoff
+#'  rel.
+#' 
+#' @param sigsets List of EA results to be compared, such as the significant genesets found 
+#' or the q-values found.
+#' @param cutoff For choosing to compare the top X results (changed from absolute to percentage).
+#' @param keep Which EA results to keep (enter string names).
+#' @param drop Which EA results to drop (enter string names).
+#' @param rel  Boolean if we want the overlap to be normalised by setsize rather than having absolute overlaps.
+#'        We generally want this on as it computes the Jaccard index.
+#' @param corr Character name of the correlation method {"pearson", "spearman"} for comparing q-values.
+#'        Otherwise, it defaults to a boolean to calculate the set overlap.
+#' @param logt Boolean if we are logtransforming the q-values, needs (corr==TRUE) to work.
+#' @param pval Boolean if we want a matrix of p-values for the correlation values, results in a binary matrix.
+#' @param ij   Boolean if we want to only compute the similarity values for the 
+make.overlapmatrix <- function (sigsets, cutoff=50, keep=c(), drop=c(), rel=TRUE, corr=FALSE, logt=FALSE, pval=FALSE , ij=FALSE)
+{
+  # For when we are using the correlation function (this is contrived but there are already so many arguments).
+  if (corr != FALSE)
+  {
+    corr.method <- corr
+    corr <- TRUE
+  }
+    
+  # For when we want to consider only specific parts of the list.
+  if (length(keep > 0)) sigsets <- sigsets[which(names(sigsets) %in% chartr("a-zA-Z", "A-Za-z", keep))]
+  
+  # For when we want to ignore the specific parts of the list.
+  if (length(drop > 0)) sigsets <- sigsets[-which(names(sigsets) %in% chartr("a-zA-Z", "A-Za-z", drop))]
+  
+  # For when all genesets found are being compared.
+  if (!is.null(cutoff)) {if (is.na(cutoff)) cutoff <- NULL else if (is.numeric(cutoff) & cutoff==0) cutoff <- NULL}
+  if (is.null(cutoff) | corr) cutoff <- max(unlist(lapply(sigsets, length)))
+  if (cutoff == 0) cutoff <- 100
+  
+  # For when we want to log-transform the q-values.
+  if (corr==TRUE)
+  {
+    # print(unlist(lapply(sigsets, length)))
+    # Check that all sets of q-values are of the same length.
+    if (min(unlist(lapply(sigsets, length))) != max(unlist(lapply(sigsets, length)))) 
+      if (!ij) 
+        stop("q-value list lengths vary")
+    
+    # If desired, apply log-transform AND replace zeros with the smallest non-zero value (to 6 decimal places).
+    if(logt==TRUE) for (i in 1:length(sigsets)) { sigsets[i] <- list(log2(replace(sigsets[[i]], sigsets[[i]]==0, 0.000001))) }
+  
+  # For when we want to crop the data the top X most significant sets.
+  # } else { for (i in 1:length(sigsets)) { sigsets[i] <- list(sigsets[[i]][1:min(cutoff, length(sigsets[[i]]))]) }  } 
+  } else for (i in 1:length(sigsets)) sigsets[i] <- list(sigsets[[i]][1:round(length(sigsets[[i]]) * cutoff/100)]) 
+  
+  # Create an overlaps matrix the quantify the overlapping sets.
+  overlap.matrix <- matrix(, nrow=length(sigsets), ncol=length(sigsets))
+  
+  for (i in c(1:length(sigsets)))
+  {
+    for (j in c(i:length(sigsets)))
+    {
+      if (ij)
+        if (substring(names(sigsets)[i], 3, 100) != substring(names(sigsets)[j], 3, 100))
+          next
+      
+      # Compute similarity.
+      if (corr==TRUE) 
+      {
+        overlap.matrix[i,j] <- cor(sigsets[[i]], sigsets[[j]], method=corr.method)
+        
+        if (pval==TRUE)
+        {
+          if (is.na(cor.test(sigsets[[i]], sigsets[[j]], method=corr.method)$p.value))
+            overlap.matrix[i,j] <- NA
+          else if (cor.test(sigsets[[i]], sigsets[[j]], method=corr.method)$p.value > 0.05)
+            overlap.matrix[i,j] <- NA
+        }
+        
+      # Try Jaccard with null set check (a null set is an empty set).
+      } else if (is.null(sigsets[[i]]) | is.null(sigsets[[j]])) {
+        overlap.matrix[i,j] <- 0
+      
+      # Compute Jaccard.  
+      } else {
+        overlap.matrix[i,j] <- length(comparelists(sigsets[[i]], sigsets[[j]])$intersect)
+        if (rel==TRUE) overlap.matrix[i,j] <- overlap.matrix[i,j] / length(unique(c(sigsets[[i]], sigsets[[j]])))
+      }
+    }
+  }
+  
+  colnames(overlap.matrix) <- names(sigsets)
+  rownames(overlap.matrix) <- names(sigsets)
+  
+  return(overlap.matrix)
+}
+
+```
+
+```{r}
+
+# m.temp <- matrix(rep(c(1:11), 11), nrow=11, ncol=11)
+# colnames(m.temp) <- paste0("", LETTERS[1:11])
+# rownames(m.temp) <- paste0("", LETTERS[1:11])
+# 
+# m.temp
+# 
+# for (i in 1:length(colnames(m.temp)))
+#   for (j in i:length(colnames(m.temp)))
+#     m.temp[i,j] <- m.temp[j,i]
+# 
+# #m.temp
+#     
+# 
+# 
+# c <- crop.diag.matrix(m.temp, 4)
+# c
+# # 
+# # c <- c[c(dim(c)[1]:1), c(dim(c)[2]:1), drop=FALSE]
+# # c
+
+
+# make.overlapmatrix(get.geneset(b.sigsets.full), cutoff=0, rel=TRUE)
+# set.b <- get.q.value(b.sigsets.full)
+# set.b <- set.b[sapply(set.b, length) == max(sapply(set.b, length))]
+# make.overlapmatrix(set.b, corr="pearson")[13:12, 1:12]
+# crop.diag.matrix(make.overlapmatrix(set.b, corr="pearson"), which(substring(names(set.b), 1, 1) %in% "c")[1])
+
+```
+
+
+```{r}
+
+#' Crops and diagonalises an overlaps matrix.
+#' 
+#' @param m Diagonal matrix with the identical values and order for column and row names.
+#' @param s Crops to the left of this column/above this row (inclusive).
+crop.diag.matrix <- function(m, n)
+{
+  # Enforce idenical values and order for column names and row names
+  if (sum(rownames(m) != colnames(m)) != 0) stop("Malformed input, row and column names are not identical.")
+  
+  # Grab the index of the column or row corresponding to n.
+  if (is.character(n)) ind <- match(n, rownames(m)) else ind <- as.numeric(n)
+  e <- length(colnames(m))
+  
+  # Crop the matrix m to size.
+  c <-  matrix(, nrow=length(ind:e), ncol=length(ind:e))
+  # colnames(c) <- colnames(m)[ind:e]
+  # rownames(c) <- rownames(m)[1:(e-ind+1)]
+  rownames(c) <- colnames(m)[ind:e]
+  colnames(c) <- rownames(m)[1:(e-ind+1)]
+  
+  # Diagonalise the cropped matrix.
+  for (i in 1:(e-ind+1))
+  {
+    for (j in i:(e-ind+1))
+    {
+      c[i,j] <- m[i, (j-1+ind)]
+    }
+  }
+  
+  # Flip the matrix for formatting preference.
+  # c <- c[c(dim(c)[1]:1), c(dim(c)[2]:1), drop=FALSE]
+  # 
+  # for (i in c(1:length(names(c))))
+  #   for (j in c(i:length(names(c))))
+  #     c[i,j] <- c[j,i]
+  # 
+  # rownames(c) <- colnames(m)[ind:e]
+  # colnames(c) <- rownames(m)[1:(e-ind+1)]
+  
+  return(c)
+}
+
+```
+
+```{r}
+# Tidy heatmap method, simply for nicer looking code.
+# XXX rotate by 90 degrees.
+
+make.heatmap <- function (data, title=character(0), name="heat I guess", col=c("red", "white", "blue"), legend=FALSE, ret=TRUE) 
+{
+  if(sum(col==FALSE)==1) col <- c("red", "white", "blue")
+  
+  ht <- Heatmap( (data), name=name, col=rev(col), na_col="white", #col = heat.colors(10),
+        cluster_rows=FALSE, cluster_columns=FALSE,
+        row_dend_reorder=FALSE, column_dend_reorder=FALSE,
+        column_names_side="top", column_names_rot=-90,
+        row_names_gp=gpar(fontsize = 25),
+        column_names_gp=gpar(fontsize = 25),
+        show_heatmap_legend=legend,
+        heatmap_legend_param=(list(at=c(-1,-0.8,-0.5,-0.3, 0, 0.3,0.5,0.8,1))),
+        #row_names_side="left", row_names_rot=0,
+        column_title=title)
+  
+  if (ret) 
+    return(ht) 
+  else 
+    draw(ht)
+}
+```
+
+```{r}
+#
+
+#'
+#'
+#' @param sets A list of genesets to be compared
+#' @param diff Boolean toggling whether to return the overlap or the difference.
+#' @param bg The ultimate background set, normally "bg.set"
+get.overlaps <- function (sets, diff=FALSE, bg=bg.set)
+{
+  # Check that sets has mutliple entries.
+  if (length(sets) < 2) stop("Only one set was submitted for a multi-set comparison method.")
+  
+  # Find overlaps.
+  l <- bg
+  
+  # if (diff)  for (s in sets) { if (!is.null(s)) l <- list(unlist( comparelists(unlist(l), unlist(s))$Set.Diff )) }
+  # if (!diff) for (s in sets) { if (!is.null(s)) l <- list(unlist( comparelists(unlist(l), unlist(s))$intersect )) }
+  
+  if (diff)  for (s in sets) { l <- list(unlist( comparelists(unlist(l), unlist(s))$Set.Diff )) }
+  if (!diff) for (s in sets) { l <- list(unlist( comparelists(unlist(l), unlist(s))$intersect )) }
+  
+  l <- unlist(l)
+  #if (diff) l <- bg[-which(bg %in% l)]
+  
+  return(l)
+}
+  
+```
+
+## distance matrix
+
+```{r}
+
+distance_matrix <- function(sigsets){
+
+  # Create an overlaps matrix the quantify the overlapping sets.  
+  overlap.matrix <- matrix(, nrow=length(sigsets), ncol=length(sigsets))
+  
+  for (i in c(1:length(sigsets)))
+  {
+    for (j in c(i:length(sigsets)))
+    {
+      # Jaccard Index.
+      if (length(sigsets[[i]]) > 0) overlap.matrix[i,j] <- 1 - ((length(comparelists(sigsets[[i]], sigsets[[j]])$intersect)) / length(unique(c(sigsets[[i]], sigsets[[j]])))) else overlap.matrix[i,j] <- 1
+      overlap.matrix[j,i] <- overlap.matrix[i,j]
+    }
+  }
+  
+  colnames(overlap.matrix) <- names(sigsets)
+  rownames(overlap.matrix) <- names(sigsets)
+  
+  # Return for clustering.
+  return(overlap.matrix)
+}
+
+```
+
+## binary matrix
+
+```{r}
+# Binary natrix for whether or not a gene is present in a genesets.
+# Feed in a mmu.gs like object.
+
+binary_matrix <- function(g, s=FALSE){
+  
+  # Set the columns as the genes present in the significant sets.
+  genes <- unique(unlist(g))
+  if (s) genes <- sort(genes)
+  
+  df <- data.frame(data.frame(matrix(ncol = length(genes), nrow = 0)))
+  colnames(df) <- genes
+  
+  # Set the rows as the genesets.
+  df[1:length(names(g)), ] <- 0
+  rownames(df) <- names(g)
+  
+  # Set the binaries for whether the genes are present in each geneset.
+  for (i in 1:length(g)) df[i, which(genes %in% g[[i]])] <- 1
+  
+  return(df)
+  
+}
+
+```
+
+## db imports
+
+```{r}
+
+get_wikipathways <- function() {
+  
+  # Get metadata.
+  pw <- listPathways("Mus musculus")
+  
+  # Compile pathways.
+  gs <- list()
+  for (i in pw$id)
+  {
+    #gs <- list(unlist(gs), getXrefList(i, "L"))
+    #print(i)
+    gs[[length(gs)+1]] <- getXrefList(i, "L")
+  }
+  
+#  gs <- list(unlist(gs))
+  
+  # Assign names.
+  names(gs) <- pw$name
+  
+  return(gs)
+}
+
+```
+
+```{r}
+
+get_reactome <- function(){
+  
+  cpdb <- read.csv("data/CPDB_pathways_genes.csv", sep="\t")
+  db <- cpdb[cpdb$source == "Reactome",]
+  
+  # Compile pathways.
+  gs <- list()
+  for (i in 1:dim(db)[1])
+  {
+    gs[[length(gs)+1]] <- unlist(strsplit(db$entrez_gene_ids[i], ","))
+  }
+  
+  # Assign names.
+  names(gs) <- db$pathway
+  
+  return(gs)
+}
+
+```
+
+```{r}
+
+get_mousecyc <- function(){
+  
+  cpdb <- read.csv("data/CPDB_pathways_genes.csv", sep="\t")
+  db <- cpdb[cpdb$source == "MouseCyc",]
+  
+  # Compile pathways.
+  gs <- list()
+  for (i in 1:dim(db)[1])
+  {
+    gs[[length(gs)+1]] <- unlist(strsplit(db$entrez_gene_ids[i], ","))
+  }
+  
+  # Assign names.
+  names(gs) <- db$pathway
+  gs <- gs[-202]
+  
+  return(gs)
+}
+
+```
+
+## import results
+
+```{r include=FALSE} 
+
+#' Import the enrichment results and gether them into one list of results.
+import.sigsets.full <- function(path, exp, db) {
+  
+  path <- paste0(path,"/", exp)
+
+  t.ora <- read_csv(paste0(path, "_1_ORA.csv"))
+  t.gsea <- read_csv(paste0(path, "_2_GSEA.csv"))
+  t.gsa <- read_csv(paste0(path, "_3_GSA.csv"))
+  t.padog <- read_csv(paste0(path, "_4_PADOG.csv"))
+  t.mrgse <- read_csv(paste0(path, "_5_MRGSE.csv"))
+  t.camera.one <- read_csv(paste0(path, "_6_CAMERAv1.csv"))
+  t.camera.two <- read_csv(paste0(path, "_7_CAMERAv2.csv"))
+  t.roast <- read_csv(paste0(path, "_8_ROAST.csv"))
+  t.globaltest <- read_csv(paste0(path, "_9_GLOBALTEST.csv"))
+  t.gsva <- read_csv(paste0(path, "_10_GSVA.csv"))
+  t.plage <- read_csv(paste0(path, "_11_PLAGE.csv"))
+
+  # WikiPathways naming convention fix.
+  # if(db == "wikipathways")
+  # {
+  #   pw <- listPathways("Mus musculus")
+  #   wp_dict <- data.frame(id=pw$id, name=pw$name)
+  #   
+  #   t.gsa <- rename_wp(t.gsa, wp_dict)
+  #   t.padog <- rename_wp(t.padog, wp_dict)
+  #   t.mrgse <- rename_wp(t.mrgse, wp_dict)
+  #   t.camera.one <- rename_wp(t.camera.one, wp_dict)
+  #   t.camera.two <- rename_wp(t.camera.two, wp_dict)
+  #   t.roast <- rename_wp(t.roast, wp_dict)
+  #   t.gsva <- rename_wp(t.gsva, wp_dict)
+  #   t.plage <- rename_wp(t.plage, wp_dict)
+  # }
+  
+  # Apply listification.
+  v <- tolower(substring(exp,1,1))
+  t.ora <- csv_to_eb_list(t.ora, "ORA", v)
+  t.gsea <- csv_to_eb_list(t.gsea, "GSEA", v)
+  t.gsa <- csv_to_eb_list(t.gsa, "GSA", v)
+  t.padog <- csv_to_eb_list(t.padog, "PADOG", v)
+  t.mrgse <- csv_to_eb_list(t.mrgse, "MRGSE", v)
+  t.camera.one <- csv_to_eb_list(t.camera.one, "CAMERAv1", v)
+  t.camera.two <- csv_to_eb_list(t.camera.two, "CAMERAv2", v)
+  t.roast <- csv_to_eb_list(t.roast, "ROAST", v)
+  t.globaltest <- csv_to_eb_list(t.globaltest, "GLOBALTEST", v)
+  t.gsva <- csv_to_eb_list(t.gsva, "GSVA", v)
+  t.plage <- csv_to_eb_list(t.plage, "PLAGE", v)
+  
+  # Assemble the methods.
+  t.sigsets.full <- list(t.ora, 
+                    t.gsea, 
+                    t.gsa, 
+                    t.padog, 
+                    t.mrgse,
+                    t.camera.one, 
+                    t.camera.two, 
+                    t.roast, 
+                    t.globaltest, 
+                    t.gsva, 
+                    t.plage)
+
+  t.sigsets.full <- set.names(t.sigsets.full)
+  
+  return(t.sigsets.full)
+  
+}
+
+```
+
+## other
+
+```{r}
+
+hyp.type <- function(h) {
+  
+  res <- ""
+  
+  if (sum(c("ORA", "CAMERAv1", "CAMERAv2", "MRGSE") %in% h)  > 0)
+    res <- "Q1"
+  # if (sum(c("PLAGE", "PADOG", "ROAST", "GSVA", "GLOBALTEST", "GLOBATLTEST") %in% h)  > 0)
+  if (sum(c("PLAGE", "PADOG", "ROAST", "GSVA", "GLOBALTEST") %in% h)  > 0)
+    res <- "Q2"
+  if (sum(c("GSA") %in% h)  > 0)
+    res <- "Q3"
+  if (sum(c("GSEA") %in% h)  > 0)
+    res <- "Q3.2"
+  
+  return(res)
+}
+
+```
+
+```{r}
+
+meth.type <- function(h) {
+  
+  res <- ""
+  
+  if (sum(c("ORA", "GSEA", "GSA", "PADOG", "MRGSE", "CAMERAv1", "CAMERAv2") %in% h)  > 0)
+    res <- "Univariate"
+  # if (sum(c("ROAST", "GLOBALTEST", "GLOBATLTEST") %in% h)  > 0)
+  if (sum(c("ROAST", "GLOBALTEST") %in% h)  > 0)
+    res <- "Multivariate"
+  if (sum(c("PLAGE", "GSVA") %in% h)  > 0)
+    res <- "Single-Sample"
+  
+  return(res)
+}
+
+```
+
+
+```{r}
+#stop("Set up, done--") 
+```
+
+
+
+# E2 Similarity
+
+```{r}
+
+#' set.a,  set.c and set.b must be fed in with get get.q.value(..) already applied.
+get.similarity.heatmap <- function(path, sig, set.a, set.c, set.b, jaccard=TRUE, cols=TRUE, legend=FALSE, ij=FALSE, SAVE=TRUE) {
+  
+  path.een  <- paste0(path, "/figures/")
+  path.twee <- paste0(path, "/numerical_results/")
+  
+  df.names <- data.frame(name=NA, test=NA, exp=NA, log=NA, p.val=NA, size=NA)
+  
+  if (sum(is.na(set.a)) == 0)
+    if (!jaccard & !ij & (var(sapply(set.a, length)) > 0)) 
+      set.a <- set.a[sapply(set.a, length) == max(sapply(set.a, length))]
+  if (sum(is.na(set.c)) == 0)
+    if (!jaccard & !ij & (var(sapply(set.c, length)) > 0)) 
+      set.c <- set.c[sapply(set.c, length) == max(sapply(set.c, length))]
+  if (sum(is.na(set.b)) == 0)
+    if (!jaccard & !ij & (var(sapply(set.b, length)) > 0)) 
+      set.b <- set.b[sapply(set.b, length) == max(sapply(set.b, length))]
+  
+  b.switch <- which(substring(names(set.b), 1, 1) %in% "c")[1]
+  
+  # See which experiments results are present.
+  v.list <- c()
+  if (sum(is.na(set.a)) == 0) v.list <- c(v.list, 1)
+  if (sum(is.na(set.c)) == 0) v.list <- c(v.list, 2)
+  if (sum(is.na(set.b)) == 0) v.list <- c(v.list, 3)
+  
+  exp.list  <- c("(A)", "(C)", "(B)")
+  cols.list <- c("palevioletred1", "green3", "royalblue", 
+                 "honeydew", "seashell", "honeydew")
+  
+  if (jaccard) name <- "relative overlap" else name <- "correlation"
+  #size.list <- c(0, 20, 50, 100)
+  size.list <- c(25, 50, 75, 100)
+  corr.list <- c("Pearson", "Spearman")
+  bool.list <- c(FALSE, TRUE)
+  
+  
+  # For each experiment's results...
+  for (v in v.list)
+  {
+    # Set the meta data because a list-loop caused some issues.
+    if (v == 1) sim.vals <- set.a
+    if (v == 2) sim.vals <- set.c
+    if (v == 3) sim.vals <- set.b 
+    
+    exp  <- exp.list[v]
+    if(sum(cols==FALSE) != 1) 
+      cols <- cols.list[c(v, v+3)]
+    
+    graph_title <- character(0)
+    
+    # For each set of top S enriched genesets...
+    for (s in size.list)
+    {
+      # For each correlation method...
+      for (c in corr.list)
+      {
+        if (name == "correlation") name <- paste0(c, "'s")
+        
+        # For whether we want a log2 transform...
+        for (log in bool.list)
+        {
+          if (c == "Spearman") log <- FALSE 
+          
+          # For whether we want to see the binary p value matrix...
+          for (pv in bool.list) 
+          {
+            # Setting the naming parameters for human readability.
+            if (jaccard)
+            {
+              file_name            <- paste0("E1 Jaccard's Index ", exp, " ")
+              if (s < 100) file_name <- paste0(file_name, "top ", s, "% of genesets") 
+              else file_name       <- paste0(file_name, "all genesets") 
+              file_name            <- paste0(file_name, " [", sig, "]")
+              similarity.matrix <- make.overlapmatrix(sim.vals, cutoff=s, rel=TRUE, ij=ij)
+              
+            } else {
+              
+              file_name          <- paste0("E1 ", c, "'s ", exp, " [")
+              if (log) file_name <- paste0(file_name, "log, ")
+              if (pv)  file_name <- paste0(file_name, "p-vals, ")
+              file_name          <- paste0(file_name, sig, "]")
+              similarity.matrix <- make.overlapmatrix(sim.vals, corr=tolower(c), logt=log, pval=pv, ij=ij)
+            }
+            
+            if (v==3) similarity.matrix <- crop.diag.matrix(similarity.matrix, b.switch)
+            
+            # Exporting the matrix's numerical values.
+            if (SAVE) write.csv(as.data.frame(similarity.matrix), paste0(path.twee, file_name, ".csv"))
+            df.names[nrow(df.names)+1, ] <- c(file_name, (if(name=="relative overlap") "Jaccard" else c), exp, log, pv, s)
+            
+            # Plotting the heatmaps.
+            if (!ij)
+            {
+              ht <- make.heatmap(similarity.matrix, title= graph_title, name=name,
+                     col=cols, legend=legend)
+              
+              # Exporting the heatmaps.
+              if (SAVE) 
+                png(paste0(path.een, file_name, ".png"), width = 10, height = 10, units = 'in', res = 400)
+              
+              draw(ht)
+              
+              if (SAVE) 
+                dev.off()
+            }
+            
+          }
+        }
+      }
+    }
+  }
+  
+  # Clean irrelevant rows and export.
+  df.names <- distinct(df.names, name, .keep_all = TRUE)
+  if (SAVE) write_csv(df.names[-1, ], paste0(path.twee, "E1 ", (if(name=="relative overlap") "Jaccard" else "Correlation"), 
+                                             " experiment names.csv"))
+}
+
+```
+
+```{r}
+
+#' df.list is statistics.list post processing, 
+#'  i.e. a list of dataframes holding similarity results.
+sim_score_spread <- function(df.list) {
+  
+  names     <- c() # method
+  hyp.list  <- c() # type of hypothesis for this method
+  meth.list <- c() # type of method (uni, multi, single sample)
+  sim.val   <- c() # similarity measures
+  exp.list  <- c() # test
+  pval.list <- c() # p-value cropped or not
+  type.list <- c() # overlap or correlation 
+  
+  dbs.list  <- c()
+  dbs       <- database.list
+  dss.list  <- c()
+  dss       <- reg.list
+  
+  # For each experiment.
+  for (i in 1:length(df.list))
+  {
+    df <- df.list[[i]]
+    df <- df[-c(1:length(stats)), ]
+    m <- nrow(df)
+    
+    exp <- names(df.list)[i]
+    if (str_detect(exp, fixed("Jaccard"))) t <- "Overlap" else t <- "Correlation"
+    
+    exp <- str_replace(exp, fixed("E1 Jaccard's Index (B) a"), "A")
+    exp <- str_replace(exp, fixed("E1 Jaccard's Index (B) t"), "T")
+    exp <- str_replace(exp, fixed(paste0(" [", db, folder, "]")), "")
+    
+    exp.list  <- c(exp.list,  rep(exp, m*ncol(df)))
+    pval.list <- c(pval.list, rep(if (str_detect(exp, fixed("p-vals"))) "only significant correlation values" else "all correlation values", m*ncol(df)))
+    type.list <- c(type.list, rep(t, m*ncol(df)))
+    
+    # For each enrichment method.
+    for (j in 1:ncol(df))
+    {
+      # substring(temp, str_locate(temp, "a.")[1]+2, str_locate(temp, ".c.")[1]-1)
+      m.temp <- names(df)[j]
+      m.name <- method.names[which(method.names %in% substring(m.temp, 
+                             str_locate(m.temp, "a.")[1]+2, str_locate(m.temp, ".c.")[1]-1))]
+      
+      
+      sim.val   <- c(sim.val, df[, j])
+      names     <- c(names,     rep(m.name, m))
+      hyp.list  <- c(hyp.list,  rep( hyp.type(m.name), m))
+      meth.list <- c(meth.list, rep(meth.type(m.name), m))
+      
+      for (k in rownames(df))
+      {
+        dbs.list <- c(dbs.list, dbs[str_detect(fixed(k), dbs)])
+        dss.list <- c(dss.list, dss[str_detect(fixed(k), dss)])
+      }
+    }
+    
+    # Debugging print statements.
+    # print(s$metadata$method)
+    # print(s$sbea$nr.sigs)
+    # print(length(names))
+    # print(length(sig.len))
+  }
+  
+  # Re order variables for graphing reasons.
+  names     <- factor(names, method.names)
+  exp.list  <- factor(exp.list, c(unique(exp.list)))
+  meth.list <- factor(meth.list, c("Univariate", "Multivariate", "Single-Sample"))
+  # exp.list <- factor(exp.list, c("Top 25 genesets", "Top 50 genesets", "Top 75 genesets", "Top 100 genesets",
+  #                                "E1 Pearson's (B)", "E1 Pearson's (B) [p-vals]", "E1 Pearson's (B) [log]",
+  #                                "E1 Pearson's (B) [log, p-vals]", "E1 Spearman's (B)", "E1 Spearman's (B) [p-vals]"))
+  
+  res <- data.frame(method=names, similarity=sim.val, exp=exp.list, p.val=pval.list, sim.type=type.list, 
+                    hyp=hyp.list, meth.type=meth.list, db=dbs.list, ds=dss.list)
+  res$nothing <- "empty"
+  
+  return(res)
+}
+
+```
+
+```{r}
+#' corr.a and corr.c are (paired) sorted lists of correlations from get.q.value(df)
+#' feed in the correlation for one db ds combo, 
+#' returns a dataframe with the features stratified for scatter graphs.
+corr_spread <- function(corr.a, corr.c, db) {
+  
+  names     <- c()
+  hyp.list  <- c() # type of hypothesis for this method
+  meth.list <- c() # type of method (uni, multi, single sample)
+  x.val     <- c() # q-value
+  y.val     <- c()
+  x.order   <- c() # the rank of the correlation values.
+  y.order   <- c()
+  x.t.val   <- c() #q-value log2 transformed
+  y.t.val   <- c()
+  x.t.order <- c() 
+  y.t.order <- c()
+  
+  # For each experiment.
+  for (i in 1:length(names(corr.a)))
+  {
+    
+    names     <- c(names,     rep(names(corr.a)[i],            length(corr.a[[i]])))
+    hyp.list  <- c(hyp.list,  rep( hyp.type(names(corr.a)[i]), length(corr.a[[i]])))
+    meth.list <- c(meth.list, rep(meth.type(names(corr.a)[i]), length(corr.a[[i]])))
+    
+    x.val   <- c(x.val,   corr.a[[i]])
+    y.val   <- c(y.val,   corr.c[[i]])
+    x.order <- c(x.order, order(corr.a[[i]]))
+    y.order <- c(y.order, order(corr.c[[i]]))
+    
+    x.t.val   <- c(x.t.val,  -log2(corr.a[[i]]))
+    y.t.val   <- c(y.t.val,  -log2(corr.c[[i]]))
+    
+    # print(names(corr.a)[i])
+    # print(length(corr.a[[i]]))
+    # print(length(corr.c[[i]]))
+  }
+  
+  # Re order variables for graphing reasons.
+  # names[names=="GLOBATLTEST"] <- "GLOBALTEST"
+  names     <- factor(names, method.names)
+  meth.list <- factor(meth.list, c("Univariate", "Multivariate", "Single-Sample"))
+  
+  res <- data.frame(method=names, x.q=x.val, y.q=y.val, x.t.q=x.t.val, y.t.q=y.t.val, x.o=x.order, y.o=y.order, hyp=hyp.list, meth.type=meth.list)
+  
+  
+  res$a.sig5  <- FALSE
+  res$a.sig5[ res$x.q < 0.05 & res$y.q < 0.05] <- TRUE
+  res$a.sig5[res$a.sig5 == TRUE]  <- "Both are Significant"
+  res$a.sig5[res$a.sig5 == FALSE] <- "One is not Significant"
+  res$a.sig5 <- factor(res$a.sig5, c("One is not Significant", "Both are Significant"))
+  
+  res$a.sig10  <- FALSE
+  res$a.sig10[ res$x.q < 0.10 & res$y.q < 0.10] <- TRUE
+  res$a.sig10[res$a.sig10 == TRUE]  <- "Both are Significant"
+  res$a.sig10[res$a.sig10 == FALSE] <- "One is not Significant"
+  res$a.sig10 <- factor(res$a.sig10, c("One is not Significant", "Both are Significant"))
+  
+  res$a.sig  <- "One is not Significant"
+  res$a.sig[res$a.sig10 == "Both are Significant"] <- "Both Significant at 0.10"
+  res$a.sig[res$a.sig5  == "Both are Significant"] <- "Both Significant at 0.05"
+  res$a.sig <- factor(res$a.sig, c("One is not Significant", "Both Significant at 0.05", "Both Significant at 0.10"))
+  
+  # res$o.sig5  <- FALSE
+  # res$o.sig5[ res$x.q < 0.05 | res$y.q < 0.05] <- TRUE
+  # res$o.sig5[res$o.sig5==TRUE]  <- "At Least One Q-Value is Significant"
+  # res$o.sig5[res$o.sig5==FALSE] <- "Neither are Significant"
+  # res$o.sig5 <- factor(res$o.sig5, c("Neither are Significant", "At Least One Q-Value is Significant"))
+  
+  res$db <- db
+  res$nothing <- "empty"
+  
+  
+  return(res)
+}
+
+```
+
+
+```{r}
+# corr_spread(get.q.value(a.sigsets.full), get.q.value(c.sigsets.full), db, substring(folder, 2, 20))
+```
+
+# E1 Sigset size
+
+```{r}
+
+#' Barchart comparing the overall amount of significant genesets found.
+#' Feed in a.sigsets.full and c.sigsets.full style lists.
+#' path is where to save (the figures folder).
+#' signature is which figures folder the plot is being saved to.
+plot.enriched.gs.counts <- function(path, sig, set.a, set.c, SAVE=TRUE) {
+  
+  bg.set <- set.a$ORA$sbea$res.tbl$GENE.SET
+  
+  if (SAVE)
+  {
+    png(paste0(path, "E1 barchart (A) [", sig, "].png"), width = 10, height = 10, units = 'in', res = 400)
+    text(x=barplot(unlist(lapply(get.geneset(set.a, drop=F), length)), ylim=c(0,length(bg.set)), border="deeppink3",
+            col="rosybrown1", cex.names=0.75, ylab="Number of Significant Sets Found", xlab="Enrichment Analysis Method (A)"),
+         y=(unlist(lapply(get.geneset(set.a, drop=F), length))) + 10, col="deeppink3",
+         labels=(paste0(round(unlist(lapply(get.geneset(set.a, drop=F), length))*100/length(bg.set)), "%")), cex=1)
+    dev.off()
+    
+    png(paste0(path, "E1 barchart (C) [", sig, "].png"), width = 10, height = 10, units = 'in', res = 400)
+    text(x=barplot(unlist(lapply(get.geneset(set.c, drop=F), length)), ylim=c(0,length(bg.set)), border="springgreen4",
+            col="palegreen2", cex.names=0.75, ylab="Number of Significant Sets Found", xlab="Enrichment Analysis Method (C)"),
+         y=(unlist(lapply(get.geneset(set.c, drop=F), length))) + 10, col="springgreen4",
+         labels=(paste0(round(unlist(lapply(get.geneset(set.c, drop=F), length))*100/length(bg.set)), "%")), cex=1)
+    dev.off()
+    
+  } else {
+    
+    text(x=barplot(unlist(lapply(get.geneset(set.a, drop=F), length)), ylim=c(0,length(bg.set)), border="deeppink3",
+            col="rosybrown1", cex.names=0.75, ylab="Number of Significant Sets Found", xlab="Enrichment Analysis Method (A)"),
+         y=(unlist(lapply(get.geneset(set.a, drop=F), length))) + 10, col="deeppink3",
+         labels=(paste0(round(unlist(lapply(get.geneset(set.a, drop=F), length))*100/length(bg.set)), "%")), cex=1)
+    
+    text(x=barplot(unlist(lapply(get.geneset(set.c, drop=F), length)), ylim=c(0,length(bg.set)), border="springgreen4",
+            col="palegreen2", cex.names=0.75, ylab="Number of Significant Sets Found", xlab="Enrichment Analysis Method (C)"),
+         y=(unlist(lapply(get.geneset(set.c, drop=F), length))) + 10, col="springgreen4",
+         labels=(paste0(round(unlist(lapply(get.geneset(set.c, drop=F), length))*100/length(bg.set)), "%")), cex=1)
+    
+  }
+}
+
+```
+
+```{r}
+
+enriched.gs.counts <- function(sigsets, db, ds) {
+  
+  names     <- method.names
+  # names[names=="GLOBATLTEST"] <- "GLOBALTEST"
+  names     <- factor(names, method.names)
+  sig.len   <- c(unlist(lapply(get.geneset(sigsets, drop=F), length)))
+  n <- length(unique(sigsets$ORA$sbea$res.tbl$GENE.SET))
+  
+  hyp.list  <- c()
+  meth.list <- c()
+  for (mn in method.names) hyp.list  <- c( hyp.list,  hyp.type(mn))
+  for (mn in method.names) meth.list <- c(meth.list, meth.type(mn))
+  meth.list <- factor(meth.list, c("Univariate", "Multivariate", "Single-Sample"))
+  
+  res <- data.frame(method=names, length=sig.len, hyp=hyp.list, meth.type=meth.list)
+  res$prop.len <- res$length *100 / n
+  
+  res$db <- db
+  res$ds <- if (ds == "") "mixed" else ds
+  res$db <- factor(res$db, database.list)
+  res$ds <- factor(res$ds, reg.list)
+  res$n  <- n
+  res$nothing <- "empty"
+  
+  return(res)
+}
+
+```
+
+# E1 Box plots
+
+```{r}
+
+sigsets_lengths <- function(sigsets, db, ds) {
+  
+  names <- c()
+  sig.len <- c()
+  hyp.list <- c()
+  meth.list <- c()
+  
+  for (s in sigsets)
+  {
+    # Error check.
+    if (length(s$sbea$nr.sigs) == 0) print(paste0(s$metadata$method, " has no significant genesets.--"))
+    
+    # Else grab the relevant geneset name indicies.
+    gs.idx <- which(unique(s$sbea$res.tbl$GENE.SET) %in% (s$ranking$GENE.SET))  
+    
+    # Generate the vector of method names and the corresponding vector of geneset lengths.
+    names   <- c(names,   rep(s$metadata$method, length(gs.idx)))
+    sig.len <- c(sig.len, sigsets$ORA$sbea$res.tbl$NR.GENES[gs.idx])
+    
+    hyp.list  <- c(hyp.list,  rep( hyp.type(s$metadata$method), length(gs.idx)))
+    meth.list <- c(meth.list, rep(meth.type(s$metadata$method), length(gs.idx)))
+    # Debugging print statements.
+    # print(s$metadata$method)
+    # print(s$sbea$nr.sigs)
+    # print(length(names))
+    # print(length(sig.len))
+  }
+  
+  # names[names=="GLOBATLTEST"] <- "GLOBALTEST"
+  names  <- factor(names, method.names)
+  meth.list <- factor(meth.list, c("Univariate", "Multivariate", "Single-Sample"))
+  res    <- data.frame(method=names, length=sig.len, hyp=hyp.list, meth.type=meth.list)
+  res$db <- db
+  res$ds <- if (ds == "") "mixed" else ds
+  res$db <- factor(res$db, database.list)
+  res$ds <- factor(res$ds, reg.list)
+  res$nothing <- "empty"
+  
+  return(res)
+}
+
+```
+
+```{r}
+
+plot.geneset.sizes <- function(path, sig, set.a, set.c, SAVE=TRUE) {
+  
+  if (SAVE)
+  {
+    png(paste0(path, "E1 sigset size (A) [", sig, "].png"), width = 10, height = 5, units = 'in', res = 400)
+    print(ggplot(sigsets_lengths(set.a), aes(x = method, y = length)) +
+             geom_boxplot()  +  labs(title="(Apoptosis) Spread of Pathway Sizes per Method", y="Size of Pathway"))
+    dev.off()
+    
+    png(paste0(path, "E1 sigset size (C) [", sig, "].png"), width = 10, height = 5, units = 'in', res = 400)
+    print(ggplot(sigsets_lengths(set.c), aes(x = method, y = length)) +
+              geom_boxplot()  +  labs(title="(CICD) Spread of Pathway Sizes per Method", y="Size of Pathway"))
+    dev.off()
+    
+  } else {
+    
+    ggplot(sigsets_lengths(set.a), aes(x = method, y = length)) +
+           geom_boxplot()  +  labs(title="(Apoptosis) Spread of Pathway Sizes per Method", y="Size of Pathway")
+  
+    ggplot(sigsets_lengths(set.c), aes(x = method, y = length)) +
+            geom_boxplot()  +  labs(title="(CICD) Spread of Pathway Sizes per Method", y="Size of Pathway")
+  }
+}
+
+```
+
+
+# E3 Enriched GS
+
+```{r}
+
+# https://stackoverflow.com/questions/54076223/issues-with-label-positions-shape-and-overlap-colors-in-venn-diagrams
+#' The variable names are the ugliest thing I've ever created and I AM SORRY.
+find.enriched.genesets <- function(path, sig, set.a, set.c, SAVE=TRUE) {
+  
+  # Filter the enriched genesets. 
+  a.set.tp <- c(unlist(get.geneset(list(set.a$PLAGE))))
+  a.set.fn <- c(unlist(get.geneset(list(set.a$GSA, set.a$CAMERAv1, set.a$CAMERAv2))))
+  a.set.super <- comparelists(a.set.tp, a.set.fn)$intersect
+  
+  c.set.tp <- c(unlist(get.geneset(list(set.c$PLAGE))))
+  c.set.fn <- c(unlist(get.geneset(list(set.c$GSA, set.c$CAMERAv1, set.c$CAMERAv2))))
+  c.set.super <- comparelists(c.set.tp, c.set.fn)$intersect
+
+  # Filter the genesets that at least two prioritisation methods consider enriched.
+  a <- c((get.geneset(list(set.a$PADOG), drop=F)),
+         (get.geneset(list(set.a$MRGSE), drop=F)),
+         (get.geneset(list(set.a$ROAST), drop=F)),
+         (get.geneset(list(set.a$GSVA), drop=F)))
+  
+  c <- c((get.geneset(list(set.c$PADOG))),
+         (get.geneset(list(set.c$MRGSE))),
+         (get.geneset(list(set.c$ROAST))),
+         (get.geneset(list(set.c$GSVA))))
+  
+  a.set.sub.two <- c()
+  c.set.sub.two <- c()
+  for (i in 1:3){
+    for (j in (i+1):4){
+      if (!is.null(a[[j]])) if (!is.null(a[[i]])) a.set.sub.two <- c(unique(c(a.set.sub.two, unlist(comparelists(a[[i]],   a[[j]])$intersect) )))
+      if (!is.null(c[[j]])) if (!is.null(c[[i]])) c.set.sub.two <- c(unique(c(c.set.sub.two, unlist(comparelists(c[[i]],   c[[j]])$intersect) )))
+    }
+  }
+  
+  # The significant overlaps between Apoptosis and CICD
+  a.venn.sig <- comparelists(a.set.super, a.set.sub.two)$intersect
+  c.venn.sig <- comparelists(c.set.super, c.set.sub.two)$intersect
+  
+  a <- comparelists(a.venn.sig, c.venn.sig)$intersect # Intersection.
+  b <- comparelists(a.venn.sig, c.venn.sig)$Set.Diff # Only apoptotsis.
+  c <- comparelists(c.venn.sig, a.venn.sig)$Set.Diff # Only CICD.
+  
+  
+  sig.res <- list(apoptosis=a.venn.sig, CICD=c.venn.sig, intersect=a, only_apoptosis=b, only_CICD=c)
+  # export_list(sig.res, paste0(path,"significant_sets_", db, folder,".txt"))
+  
+  # Visualise.
+  if (SAVE) 
+  {
+    # Step 1: Cropping down to true-positives and removing as many false-negatives as possible.
+    venn.diagram( x = list(a.set.tp, a.set.fn), 
+                  filename=paste0(path, "E3 (A-1) filtered genesets.png"), output=FALSE, 
+                  category.names=c("TP", "¬FN"), fill=brewer.pal(3, "Pastel2")[1:2],
+                  cat.default.pos = "outer", resolution = 400, fontface="bold")
+    
+    venn.diagram( x = list(c.set.tp, c.set.fn), 
+                  filename=paste0(path, "E3 (C-1) filtered genesets.png"), output=FALSE,
+                  category.names=c("TP", "¬FN"), fill=brewer.pal(3, "Pastel2")[1:2],
+                  cat.default.pos = "outer", resolution = 400, fontface="bold")
+  
+    
+    # Step 2: Overlay the filtered genesets and genesets where at least 2 priorisation
+    #     consider them differentially enriched.
+    venn.diagram( x = list(a.set.super, a.set.sub.two), 
+                  filename=paste0(path, "E3 (A-2) differentially enriched genesets.png"), output=FALSE,
+                  category.names=c("TP + ¬FN", ">2"), fill=brewer.pal(3, "Pastel2")[1:2],
+                  cat.default.pos = "outer", resolution = 400, fontface="bold")
+    
+    venn.diagram( x = list(c.set.super, c.set.sub.two), 
+                  filename=paste0(path, "E3 (C-2) differentially enriched genesets.png"), output=FALSE,
+                  category.names=c("TP + ¬FN", ">2"), fill=brewer.pal(3, "Pastel2")[1:2],
+                  cat.default.pos = "outer", resolution = 400, fontface="bold")
+  
+    
+    # Step 3: Examining the differentially enriched genesets between experiments.
+    venn.diagram( x = list(a.venn.sig, c.venn.sig), 
+                  filename=paste0(path, "E3 (A-C) experiment overlap.png"), output=FALSE, 
+                  category.names=c("Apoptosis", "CICD"), fill=brewer.pal(3, "Pastel2")[1:2],
+                  cat.default.pos = "outer", resolution = 400, fontface="bold") 
+  }
+  
+  return(sig.res)
+}
+
+```
+
+```{r}
+
+deg_list_to_dataframe <- function(deg.list, path, SAVE=FALSE) {
+  
+  exp.name <- c()
+  gs.name  <- c()
+  
+  for (i in 1:length(deg.list))
+  {
+    for (j in deg.list[[i]])
+    {
+      exp.name <- c(exp.name, names(deg.list)[i])
+      gs.name  <- c(gs.name,  j)
+    }
+  }
+  
+  res <- data.frame(geneset=gs.name, sig.exp=exp.name)
+  if (SAVE) write_csv(res, paste0(path, "enriched_genesets.csv"))
+  
+  return(res)
+}
+
+```
+
+
+# main()
+
+## export loop
+
+```{r include=FALSE} 
+# Exporting the figures and numeric results of all the experiments.
+
+db.list <- database.list
+folder.list <- c("", "_up_reg", "_down_reg")
+
+statistic.list <- list()
+df.ssc.a <- NA # significant set counts
+df.ssc.c <- NA # significant set counts
+df.pws.a <- NA # pathway sizes
+df.pws.c <- NA # pathway sizes
+df.corr  <- NA
+
+# db.list <- c("mousecyc")
+# folder.list <- c("")
+
+# For loop to generate processed results (is exported).
+if (FALSE) 
+{
+  
+  for (db in db.list)
+  {
+    list.enrch.gs <- list()
+    
+    for (folder in folder.list)
+    {
+  
+      # Set the path and import the files.
+      path.1 <- paste0("P2_outputs/", db, "_results", folder)
+      a.sigsets.full <- import.sigsets.full(path.1, "apoptosis", db)
+      c.sigsets.full <- import.sigsets.full(path.1, "CICD", db)
+  
+      # Set B preprocessing.
+      if (((all.equal(check.geneset(a.sigsets.full), check.geneset(c.sigsets.full))) == TRUE)[1])
+      {
+        b.sigsets.full <- c(a.sigsets.full, c.sigsets.full)
+        names(b.sigsets.full) <- c(paste0("a.", names(a.sigsets.full)), paste0("c.", names(c.sigsets.full)))
+  
+        #b.switch <- which(substring(names(b.sigsets.full), 1, 1) %in% "c")[1]
+        if (length(which(substring(names(b.sigsets.full), 1, 1) %in% "c")) == 0)
+          stop("There is an issue with your B data, there is no C data--")
+  
+      } else b.sigsets.full <- NA
+      
+  
+      # Set another path and metadata for saving..
+      path.2 <- paste0(path.1, "/figures")
+      if (!dir.exists(path.2)) dir.create(path.2)
+      path.2 <- paste0(path.2,    "/")
+  
+      path.3 <- paste0(path.1, "/numerical_results")
+      if (!dir.exists(path.3)) dir.create(path.3)
+      path.3 <- paste0(path.3,    "/")
+  
+      sig  <- paste0(db, folder)
+  
+  
+      # Carry out E1: similarity experiments.
+      # get.similarity.heatmap(path.1, sig, get.q.value(a.sigsets.full), get.q.value(c.sigsets.full),
+      #                                     get.q.value(b.sigsets.full), jaccard=FALSE, cols=FALSE, legend=TRUE)
+      # get.similarity.heatmap(path.1, sig, get.geneset(a.sigsets.full, drop=FALSE), get.geneset(c.sigsets.full, drop=FALSE),
+      #                                     get.geneset(b.sigsets.full, drop=FALSE), jaccard=TRUE,  cols=FALSE, legend=TRUE)
+  
+      get.similarity.heatmap(path.1, sig, NA, NA, get.q.value(b.sigsets.full),
+                             jaccard=FALSE, ij=TRUE, cols=FALSE, legend=TRUE)
+      get.similarity.heatmap(path.1, sig, NA, NA, get.geneset(b.sigsets.full, drop=FALSE),
+                             jaccard=TRUE,  ij=TRUE, cols=FALSE, legend=TRUE)
+  
+      # Carry out E1: geneset size experiments.
+      plot.enriched.gs.counts(path.2, sig, a.sigsets.full, c.sigsets.full)
+      plot.geneset.sizes(path.2, sig, a.sigsets.full, c.sigsets.full)
+      
+      df.ssc.a <- rbind(df.ssc.a, enriched.gs.counts(a.sigsets.full, db, substring(folder, 2, 20)))
+      df.ssc.c <- rbind(df.ssc.c, enriched.gs.counts(c.sigsets.full, db, substring(folder, 2, 20)))
+      df.pws.a <- rbind(df.pws.a,    sigsets_lengths(a.sigsets.full, db, substring(folder, 2, 20)))
+      df.pws.c <- rbind(df.pws.c,    sigsets_lengths(c.sigsets.full, db, substring(folder, 2, 20)))
+      
+      # Carry out E3: differentially enriched genesets
+      degs <- find.enriched.genesets(path.2, sig, a.sigsets.full, c.sigsets.full)
+      if (FALSE) export_list(degs, path.1)
+      
+      if (TRUE) 
+      {
+        list.enrch.gs[[length(list.enrch.gs)+1]] <- deg_list_to_dataframe(degs, path.3, SAVE=TRUE)
+        list.enrch.gs[[length(list.enrch.gs)]][, "db"] <- db
+        names(list.enrch.gs)[length(list.enrch.gs)] <- if (folder == "") "mixed" else substr(folder, 2, 100)
+      }
+  
+      # Carry out E4: hierarchical clustering.
+      # todo
+  
+    }
+    
+    # Combine and export the enriched genesets for this database, across datasets.
+    if (TRUE)
+    {
+      df.enrch.gs <- data.frame(geneset=unique(a.sigsets.full$ORA$sbea$res.tbl$GENE.SET), enriched=FALSE)
+      
+      for (i in 1:length(list.enrch.gs))
+      {
+        df.temp  <- list.enrch.gs[[i]]
+        ds <- names(list.enrch.gs)[i]
+        for (j in 1:nrow(df.temp))
+        {
+          # XXX this doesn't work with wikipathways, which has an ID-geneset conversion issue.
+          # Should be fine because it's still unusable at the moment.
+          idx <- which(df.enrch.gs$geneset %in% df.temp$geneset[j])
+          df.enrch.gs[idx, ds] <- df.temp$sig.exp[j]
+        }
+        
+        df.enrch.gs$enriched[!is.na(df.enrch.gs[, ds])] <- TRUE
+      }
+      
+      if (!dir.exists("P2_outputs/sigsets")) dir.create("P2_outputs/sigsets")
+      write_csv(df.enrch.gs, paste0("P2_outputs/sigsets/dataframe_", db, ".csv"))
+    }
+  }
+}
+
+# Loop for generating dataframes for visualisations.
+if (TRUE)
+{
+  df.dbs <- import.sigsets.full("P2_outputs/kegg_results", "apoptosis", "kegg")
+  df.dbs <- df.dbs$ORA$sbea$res.tbl[, c("GENE.SET", "NR.GENES")]
+  db.tracker <- c()
+  
+  for (db in db.list)
+  {
+    for (folder in folder.list)
+    {
+      # Read paths.
+      path.1 <- paste0("P2_outputs/", db, "_results", folder)
+      a.sigsets.full <- import.sigsets.full(path.1, "apoptosis", db)
+      c.sigsets.full <- import.sigsets.full(path.1, "CICD", db)
+  
+      # Carry out E1: geneset size experiments.
+      df.ssc.a <- rbind(df.ssc.a, enriched.gs.counts(a.sigsets.full, db, substring(folder, 2, 20)))
+      df.ssc.c <- rbind(df.ssc.c, enriched.gs.counts(c.sigsets.full, db, substring(folder, 2, 20)))
+      df.pws.a <- rbind(df.pws.a,    sigsets_lengths(a.sigsets.full, db, substring(folder, 2, 20)))
+      df.pws.c <- rbind(df.pws.c,    sigsets_lengths(c.sigsets.full, db, substring(folder, 2, 20)))
+      
+      # Do the correlation dataframe.
+      if (folder == "")
+        df.corr <- rbind(df.corr, corr_spread(get.q.value(a.sigsets.full), get.q.value(c.sigsets.full), db))
+      
+      
+      # Get pathway sizes of all possible genesets.
+      idx.t <- which(a.sigsets.full$ORA$sbea$res.tbl$GENE.SET %in% df.dbs$GENE.SET)
+      if (length(idx.t) > 0)
+        df.dbs <- rbind(df.dbs, a.sigsets.full$ORA$sbea$res.tbl[, c("GENE.SET", "NR.GENES")][-idx.t, ])
+      else
+        df.dbs <- rbind(df.dbs, a.sigsets.full$ORA$sbea$res.tbl[, c("GENE.SET", "NR.GENES")])
+      
+      
+      idx.t <- which(c.sigsets.full$ORA$sbea$res.tbl$GENE.SET %in% a.sigsets.full$ORA$sbea$res.tbl$GENE.SET)
+      if (length(idx.t) > 0)
+        df.dbs <- rbind(df.dbs, c.sigsets.full$ORA$sbea$res.tbl[, c("GENE.SET", "NR.GENES")][-idx.t, ])
+      else
+        df.dbs <- rbind(df.dbs, c.sigsets.full$ORA$sbea$res.tbl[, c("GENE.SET", "NR.GENES")])
+    }
+    
+    db.tracker <- c(db.tracker, rep(db, (nrow(df.dbs)-length(db.tracker))))
+  }
+  
+  # Collecting the size of all genesets for every database.
+  df.dbs$db <- db.tracker
+  df.t <- df.dbs
+  df.t$db <- "all"
+  df.dbs <- rbind(df.dbs, df.t)
+  rm(df.t)
+  df.dbs$db <- factor(df.dbs$db, c("all", db.list))
+  
+  # Compiling the q-values used to calculate the correlation scores.
+  df.corr <- df.corr[-1, ]
+  df.corr$method.db <- NA
+  for (i in 1:nrow(df.corr))
+    df.corr$method.db[i] <- paste0(df.corr$method[i], sep.v, df.corr$db[i]) 
+    
+  
+  # Dataframe of the proportion of enriched genesets.
+  df.ssc.a$exp <- "Apoptosis"
+  df.ssc.c$exp <- "CICD"
+  df.ssc <- rbind(df.ssc.a[-1, ], df.ssc.c[-1, ])
+  rownames(df.ssc) <- NULL
+  
+  df.ssc$exp.ds <- NA
+  for (i in 1:nrow(df.ssc))
+    df.ssc$exp.ds[i] <- paste0(df.ssc$exp[i], sep.v, df.ssc$ds[i]) 
+  df.ssc$exp.ds <- factor(df.ssc$exp.ds, unique(df.ssc$exp.ds))
+  
+  # Dataframe of the size of enriched genesets.
+  df.pws.a$exp <- "Apoptosis"
+  df.pws.c$exp <- "CICD"
+  df.pws <- rbind(df.pws.a[-1, ], df.pws.c[-1, ])
+  rownames(df.pws) <- NULL
+  
+  df.pws$exp.ds <- NA
+  for (i in 1:nrow(df.pws))
+    df.pws$exp.ds[i] <- paste0(df.pws$exp[i], sep.v, df.pws$ds[i]) 
+  df.pws$exp.ds <- factor(df.pws$exp.ds, unique(df.ssc$exp.ds))
+  
+  
+  # Cleaning.
+  rm(path.1)
+  
+  # df.ssc[df.ssc$method=="GLOBATLEST", "method"] <- "GLOBALTEST"
+  # df.pws[df.pws$method=="GLOBATLEST", "method"] <- "GLOBALTEST"
+  # df.corr[df.corr$method=="GLOBATLEST", "method"] <- "GLOBALTEST"
+  
+}
+
+```
+
+
+## statistics export
+
+```{r include=FALSE} 
+# Create a (weirdly structured) dataframe for the all the results
+
+statistic.list <- list()
+
+db.list <- database.list
+folder.list <- c("", "_up_reg", "_down_reg")
+
+
+for (db in db.list)
+{
+  for (folder in folder.list)
+  {
+    
+    # Set the path and import the files.
+    path.1 <- paste0("P2_outputs/", db, "_results", folder)
+    method.names <- names(import.sigsets.full(path.1, "apoptosis", db))
+    path.3 <- paste0("P2_outputs/", db, "_results", folder, "/numerical_results/")
+    
+    
+    # Import the numerical results' locations for the similarity measures as one dataframe.
+    df.res <- rbind(read_csv(paste0(path.3, "/E1 Correlation experiment names.csv")),
+                    read_csv(paste0(path.3, "/E1 Jaccard experiment names.csv"))) 
+
+    # Re-order for standardised file input across data bases and enrichment results
+    df.res <- df.res[order(df.res$exp, df.res$test), ]
+    
+    # Skip over if there are no experiments to process (occurs when only looking at B results).
+    if (nrow(df.res) == 0)
+      next
+
+    # For each file location... (where each file location is a different experiment's results)
+    for (i in 1:nrow(df.res))
+    {
+      # Create an empty 11x11 matrix, reflecting the 11 enrichment methods.
+      df.temp <- (read.csv(paste0(path.3, df.res$name[i], ".csv")))
+      rownames(df.temp) <- df.temp[, 1]
+      df.temp <- df.temp[,-1]
+      m.temp <- matrix(, nrow=11, ncol=11)
+      colnames(m.temp) <- method.names
+      rownames(m.temp) <- method.names
+      
+      
+      # Read in the data and input it into matrix in the corresponding name order.
+      if (!str_detect(df.res$name[i], fixed("(B)"))) 
+      {
+        for (j in c(1:nrow(df.temp)))
+          for (k in c(1:ncol(df.temp)))
+            m.temp[which(rownames(m.temp) %in% rownames(df.temp)[j]),
+                   which(colnames(m.temp) %in% colnames(df.temp)[k])] <- df.temp[j,k]
+      
+      # Adjustments for the B dataset.  
+      } else {
+        colnames(m.temp) <- paste0("a.", colnames(m.temp))
+        rownames(m.temp) <- paste0("c.", rownames(m.temp))
+        
+        for (j in c(1:nrow(df.temp)))
+          for (k in c(1:ncol(df.temp)))
+            if (substring(rownames(df.temp), 3, 100)[j] == substring(colnames(df.temp), 3, 100)[k])
+              m.temp[which(rownames(m.temp) %in% rownames(df.temp)[j]),
+                     which(colnames(m.temp) %in% colnames(df.temp)[k])] <- df.temp[j,k]
+      }
+      m.temp <- t_pose(as.data.frame(m.temp))
+
+      
+      # Identify which experiment we're working with.
+      exp.name <- df.res$name[i]
+      exp.name <- str_replace(exp.name, fixed(paste0(", ", db, folder)), "")
+      exp.name <- str_replace(exp.name, fixed(paste0(" [", db, folder, "]")), "")
+      
+      # Identify which pre-existing dataframe this experiment corresponds to. If none, create one.
+      idx <- which(names(statistic.list) %in% exp.name)
+      if (length(idx) == 0)
+      {
+        # Create.
+        n <- length(statistic.list) + 1
+        statistic.list[[n]] <- t_pose(data.frame(as.numeric(paste0(rep(1:11, each=11), ".", rep(1:11)))))
+        colnames(statistic.list[[n]]) <- paste0(rep(method.names, each=11), ".", rep(method.names))
+        colnames(statistic.list[[n]]) <- paste0(rep(rownames(m.temp), each=11), ".", rep(colnames(m.temp)))
+        statistic.list[[n]] <- statistic.list[[n]][-1, ]
+        names(statistic.list)[n] <- exp.name
+        
+        # Update.
+        idx <- which(names(statistic.list) %in% exp.name)
+      }
+      
+      
+      # Convert the read data into a list and append it as a row to its respective experiment dataframe.
+      n <- nrow(statistic.list[[idx]])
+      statistic.list[[idx]][n+1, ] <- c(unlist(as.list(m.temp)))
+
+      # Label the row for later identification.
+      row.names(statistic.list[[idx]])[n+1] <- paste0(db, ".results.", 
+                                                      if (folder == "") "mixed" else substr(folder, 2, nchar(folder)))
+    }
+  }
+}
+
+statistic.list.save <- statistic.list
+
+```
+
+```{r}
+# Clean data frames and create summary statistics.
+
+statistic.list <- statistic.list.save
+
+stat.list <- c("mean", "lower", "upper", "n")
+stats <- c(stat.list)
+
+
+alpha <- 0.05
+
+# For each experiment's dataframe...
+for (i in 1:length(statistic.list))
+{
+  
+  # if (str_detect(names(statistic.list)[i], fixed("(B)"))) next
+
+  df <-statistic.list[[i]]
+  for (j in 1:length(stats))
+    df <- rbind(NA, df)
+  rownames(df)[1:length(stats)] <- stats
+   
+  drop <- c()
+  
+  # For each similarity metric pair...
+  for (j in 1:ncol(df))
+  {
+    # Check for rows that are entirely NA.
+    if (FALSE) stop(paste0("We've got a problem here, at ", i, ", chief.-- "))
+    
+    # Check if the column contains any data. (Recall, diagonalised matrices.)
+    if (sum(is.na(df[, j])) == nrow(df))
+    {
+      drop <- c(drop, j)
+      next
+    }
+    
+    n <- !is.na(df[, j])
+    df["mean", j ] <- mean(df[n, j])
+    
+    sd  <-   sd(df[n, j])
+    n  <- sum(n)
+    margin <- qt(0.975, df=n-1) * (sd/sqrt(n)) # df here means "degrees of freedom"
+    df["lower",  j] <- df["mean", j] - margin
+    df["upper",  j] <- df["mean", j] + margin
+    df["n", j ]    <- sum(n)
+    
+  }
+  
+  # Remove the columns with no entries.
+  if (length(drop) > 0)
+    statistic.list[[i]] <- df[, -drop]
+}
+
+```
+
+
+## visualisation
+
+```{r}
+
+theme.global <- theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+                      axis.title.x=element_blank(),
+                      legend.title=element_blank(),
+                      legend.position = "top", 
+                      plot.title = element_text(hjust = 0.5),
+                      plot.subtitle = element_text(hjust = 0.5))
+
+save.it <- TRUE
+show.fig <- FALSE
+
+```
+
+
+### E1-A Proportion
+
+```{r}
+  
+# if (save.it) png("P2_outputs/summary_statistics/E1 Proportion.png",
+#                  width = 6, height = 3, units = 'in', res = 400)
+#   print( ggplot(df.ssc, aes(x=method, y=length, fill=method)) +
+#            geom_violin(alpha=0.25,) +
+#            #geom_boxplot(width=0.2, outlier.shape = NA) + 
+#            scale_y_continuous(limits=c(bound.d, bound.u)) + #facet_wrap(~exp, scale="free") +
+#            labs(title="Size of Enriched Genesets", 
+#                 x="Enrichment Method", y="Number of Genes") +
+#            theme.global + guides(fill=FALSE)
+#          )
+# if (save.it) dev.off()
+
+```
+
+
+#### exp.ds
+
+```{r}
+
+# print( ggplot(df.ssc, aes(x=method, y=prop.len, fill=exp)) +
+#          paletteer::scale_fill_paletteer_d("fishualize::Pseudocheilinus_tetrataenia")  +
+#          geom_violin(alpha=0.25) +
+#          #geom_boxplot() + 
+#          facet_grid(~hyp, scale="free_x", space = "free_x") +
+#          labs(title="Size of Enriched Genesets",
+#               x="Enrichment Method", y="Proportion of Enriched Genesets") +
+#          theme(axis.title.x=element_blank(),
+#                       legend.title=element_blank(),
+#                       legend.position = "top", 
+#                       plot.title = element_text(hjust = 0.5),
+#                       plot.subtitle = element_text(hjust = 0.5)) +
+#          guides(fill=guide_legend(nrow = 1, byrow=TRUE))
+#        )
+
+```
+
+```{r include=FALSE} 
+if (save.it) png("P2_outputs/summary_statistics/E1-A Proportion exp_ds 1.png",
+                 width = 7, height = 4.35, units = 'in', res = 400)
+
+# Plot the spread of the proportion of genesets found to be differentially enriched.
+print( ggplot(df.ssc, aes(x=method, y=prop.len, fill=exp.ds)) +
+         paletteer::scale_fill_paletteer_d("MetBrewer::Homer2") + 
+         geom_boxplot(outlier.color=NA) + coord_cartesian(ylim = c(0, 100)) + #facet_wrap(~ds, scale="free") +
+         labs(title="Proportion of Genesets Enriched", subtitle="n = 6",
+              x="Enrichment Method", y="Genesets Considered Enriched (%)") +
+         theme.global + guides(fill=guide_legend(nrow = 2, byrow = TRUE))
+       )
+
+
+if (save.it) dev.off()
+```
+
+```{r}
+df.ssc$nothing <- "Hypothesis"
+plot1 <- ( ggplot(df.ssc, aes(x=hyp, y=prop.len, fill=exp.ds)) +
+         paletteer::scale_fill_paletteer_d("MetBrewer::Homer2") + 
+         geom_boxplot(outlier.color=NA) + coord_cartesian(ylim = c(0, 100)) + facet_wrap(~nothing, scale="free") +
+         labs(title="n = [24, 30, 6, 6]",
+              x="Enrichment Method", y="Genesets Considered Enriched (%)") +
+         theme.global + guides(fill=guide_legend(nrow = 2, byrow = TRUE))
+       )
+df.ssc$nothing <- "Type of Method"
+plot2 <- ( ggplot(df.ssc, aes(x=meth.type, y=prop.len, fill=exp.ds)) +
+         paletteer::scale_fill_paletteer_d("MetBrewer::Homer2") + 
+         geom_boxplot(outlier.color=NA) + coord_cartesian(ylim = c(0, 100)) + facet_wrap(~nothing, scale="free") +
+         labs(title="n = [42, 12, 12]",
+              x="Enrichment Method", y="Genesets Considered Enriched (%)") +
+         theme.global + guides(fill=guide_legend(nrow = 2, byrow = TRUE))
+       )
+
+  
+if (save.it) png("P2_outputs/summary_statistics/E1-A Proportion exp_ds 1.5 hyp and meth_type.png", 
+                 width = 7, height = 4.35, units = 'in', res = 400)
+guide_area() + (plot1 + plot2) +
+  plot_layout(guides = "collect", nrow = 2, heights = c(1,8)) +
+  plot_annotation() &
+  theme(legend.position = "top",
+        legend.box.margin=margin(0, 30, 5, 0),
+        plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+if (save.it) dev.off()
+
+rm(plot1, plot2)
+```
+
+```{r}
+df.t <- df.ssc[df.ssc$meth.type=="Univariate" | df.ssc$method=="GSVA", ]
+df.t$method <- factor(df.t$method, c(c("ORA", "MRGSE", "CAMERAv1", "CAMERAv2",
+                                     "GSVA", "GSA", "PADOG", "GSEA")))
+df.t[df.t$hyp!="Q1", "hyp"] <- "Self-Contained and Hybrid"
+df.t[df.t$hyp=="Q1", "hyp"] <- "Competitive"
+
+
+if (save.it) png("P2_outputs/summary_statistics/E1-A Proportion exp_ds 2 univariate.png",
+                 width = 7, height = 4.35, units = 'in', res = 400)
+# Plot the spread of the proportion of genesets found to be differentially enriched.
+print( ggplot(df.t, aes(x=method, y=prop.len, fill=exp.ds)) +
+         paletteer::scale_fill_paletteer_d("MetBrewer::Homer2") + facet_wrap(~hyp, scale="free") +
+         geom_boxplot(outlier.colour=NA) + coord_cartesian(ylim = c(0, 50)) +
+         labs(title="Proportion of Genesets Enriched", 
+              subtitle="n = 6",
+              x="Enrichment Method", y="Genesets Considered Enriched (%)") +
+         theme.global + 
+         theme(plot.title=element_blank()) + guides(fill=guide_legend(nrow = 2, byrow=TRUE))
+       )
+if (save.it) dev.off()
+
+
+if (save.it) png("P2_outputs/summary_statistics/E1-A Proportion exp_ds univariate db.png",
+                 width = 7, height = 4.35, units = 'in', res = 400)
+print( ggplot(df.t, aes(x=db, y=prop.len, fill=exp.ds)) +
+         # paletteer::scale_fill_paletteer_d("PNWColors::Sailboat", direction=-1) + 
+         # paletteer::scale_fill_paletteer_d("ghibli::PonyoMedium", direction=-1) +
+         # paletteer::scale_fill_paletteer_d("MetBrewer::Nizami")  +
+         paletteer::scale_fill_paletteer_d("MetBrewer::Homer2") +
+         # facet_wrap(~hyp, scale="free") +
+         geom_boxplot(outlier.shape=NA) + coord_cartesian(ylim = c(0, 50)) +
+         labs(title="Proportion of Genesets Enriched", subtitle="n = 8",
+              x="Enrichment Method", y="Genesets Considered Enriched (%)") +
+         theme.global + 
+         theme(plot.title=element_blank()) + guides(fill=guide_legend(nrow = 2, byrow=TRUE))
+       )
+if (save.it) dev.off()
+rm(df.t)
+```
+
+```{r}
+df.ssc$method2 <- df.ssc$method
+df.ssc$method2 <- factor(df.ssc$method2, c("OTHER", "ROAST",  "PLAGE"))
+df.ssc$method2[df.ssc$method=="GSVA"] <- "OTHER"
+df.ssc$method2[df.ssc$method=="GLOBALTEST"] <- "OTHER"
+df.ssc$method2[df.ssc$meth.type=="Univariate"] <- "OTHER"
+
+if (save.it) png("P2_outputs/summary_statistics/E1-A Proportion exp_ds 3 univariate.png",
+                 width = 4, height = 6, units = 'in', res = 400)
+print( ggplot(df.ssc, aes(x=method2, y=prop.len, fill=exp.ds)) +
+         paletteer::scale_fill_paletteer_d("MetBrewer::Homer2") + # facet_wrap(~hyp, scale="free") +
+         geom_boxplot(outlier.colour=NA) + coord_cartesian(ylim = c(0, 100)) +
+         labs(title="Proportion of Genesets Enriched", subtitle="n = [54, 6, 6]",
+              x="Enrichment Method", y="Genesets Considered Enriched (%)") +
+         theme.global + guides(fill=guide_legend(nrow = 3, byrow=FALSE))
+         # theme.global + guides(fill=FALSE)
+       )
+if (save.it) dev.off()
+
+df.ssc <- df.ssc[, -c(which(colnames(df.ssc) %in% "method2"))]
+
+```
+
+
+
+
+#### db
+
+```{r include=FALSE} 
+if (save.it) png("P2_outputs/summary_statistics/E1-B Proportion db 1.png",
+                 width = 7, height = 4.35, units = 'in', res = 400)
+
+# Plot the spread of the proportion of genesets found to be differentially enriched.
+print( ggplot(df.ssc, aes(x=method, y=prop.len, fill=db)) +
+         paletteer::scale_fill_paletteer_d("feathers::galah") +
+         geom_boxplot(outlier.colour=NA) + coord_cartesian(ylim = c(0, 100)) +
+         labs(title="Proportion of Genesets Enriched", subtitle="n = 6",
+              x="Enrichment Method", y="Genesets Considered Enriched (%)") +
+         theme.global + guides(fill=guide_legend(nrow = 1))
+       )
+
+if (save.it) dev.off()
+```
+
+```{r include=FALSE} 
+df.ssc$nothing <- "Hypothesis"
+plot1 <- ( ggplot(df.ssc, aes(x=hyp, y=prop.len, fill=db)) +
+         paletteer::scale_fill_paletteer_d("feathers::galah") +
+         # paletteer::scale_fill_paletteer_d("PNWColors::Sailboat", direction=-1) +
+         geom_boxplot(outlier.colour=NA) + coord_cartesian(ylim = c(0, 100)) + facet_wrap(~nothing, scale="free") +
+         labs(title="n = [24, 30, 6, 6]",
+              x="Enrichment Method", y="Genesets Considered Enriched (%)") +
+         theme.global + guides(fill=guide_legend(nrow = 1))
+       )
+df.ssc$nothing <- "Type of Method"
+plot2 <- ( ggplot(df.ssc, aes(x=meth.type, y=prop.len, fill=db)) +
+         paletteer::scale_fill_paletteer_d("feathers::galah") +
+         geom_boxplot(outlier.colour=NA) + coord_cartesian(ylim = c(0, 100)) + facet_wrap(~nothing, scale="free") +
+         labs(title="n = [42, 12, 12]",
+              x="Enrichment Method", y="Genesets Considered Enriched (%)") +
+         theme.global + guides(fill=guide_legend(nrow = 1))
+       )
+
+  
+if (save.it) png("P2_outputs/summary_statistics/E1-B Proportion db 1.5 hyp and meth_type.png", 
+                 width = 7, height = 4.35, units = 'in', res = 400)
+guide_area() + (plot1 + plot2) +
+  plot_layout(guides = "collect", nrow = 2, heights = c(1,10)) +
+  plot_annotation() &
+  theme(legend.position = "top",
+        legend.box.margin=margin(0, 30, 10, 0),
+        plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+if (save.it) dev.off()
+
+rm(plot1, plot2)
+
+``` 
+
+```{r include=FALSE} 
+# Can be better.
+# if (save.it) png("P2_outputs/summary_statistics/E1-B Proportion db univariate.png",
+#                  width = 4, height = 6, units = 'in', res = 400)
+# 
+# # Plot the spread of the proportion of genesets found to be differentially enriched.
+# print( ggplot(df.ssc[df.ssc$meth.type=="Univariate", ], aes(x=hyp, y=prop.len, fill=db)) +
+#          paletteer::scale_fill_paletteer_d("feathers::galah") +
+#          geom_boxplot() + coord_cartesian(ylim = c(0, 50)) +
+#          labs(title="Proportion of Genesets Enriched", subtitle="n = 6",
+#               x="Enrichment Method", y="Genesets Considered Enriched (%)") +
+#          theme.global + guides(fill=guide_legend(nrow = 2, byrow=TRUE))
+#        )
+# 
+# if (save.it) dev.off()
+```
+
+```{r include=FALSE} 
+# Just kinda confusing... what is this? :nauseaous:
+# if (save.it) png("P2_outputs/summary_statistics/E1-B Proportion db univariate db.png",
+#                  width = 4, height = 6, units = 'in', res = 400)
+# 
+# # Plot the spread of the proportion of genesets found to be differentially enriched.
+# print( ggplot(df.ssc[df.ssc$meth.type=="Univariate", ], aes(x=db, y=prop.len, fill=hyp)) +
+#          paletteer::scale_fill_paletteer_d("PNWColors::Sailboat", direction=-1) +
+#          geom_boxplot() + coord_cartesian(ylim = c(0, 50)) +
+#          labs(title="Proportion of Genesets Enriched", subtitle="n = 6",
+#               x="Enrichment Method", y="Genesets Considered Enriched (%)") +
+#          theme.global + guides(fill=guide_legend(nrow = 1))
+#        )
+# 
+# if (save.it) dev.off()
+```
+
+```{r include=FALSE} 
+
+# df.ssc$meth.type[df.ssc$method=="GLOBALTEST"] <- "Multivariate"
+df.t <- df.ssc[df.ssc$meth.type=="Univariate" | df.ssc$method=="GSVA", ]
+df.t$method <- factor(df.t$method, c(c("ORA", "MRGSE", "CAMERAv1", "CAMERAv2",
+                                    "GSVA", "GSA", "PADOG", "GSEA")))
+df.t[df.t$hyp!="Q1", "hyp"] <- "Self-Contained and Hybrid"
+df.t[df.t$hyp=="Q1", "hyp"] <- "Competitive"
+
+
+if (save.it) png("P2_outputs/summary_statistics/E1-B Proportion db 2 univariate hyp.png",
+                 width = 7, height = 4.35, units = 'in', res = 400)
+# Plot the spread of the proportion of genesets found to be differentially enriched.
+print( ggplot(df.t, aes(x=method, y=prop.len, fill=db)) +
+         paletteer::scale_fill_paletteer_d("feathers::galah") + facet_wrap(~hyp, scale="free") +
+         geom_boxplot(outlier.colour=NA) + coord_cartesian(ylim = c(0, 50)) +
+         labs(title="Proportion of Genesets Enriched", subtitle="n = 6",
+              x="Enrichment Method", y="Genesets Considered Enriched (%)") +
+         theme.global + guides(fill=guide_legend(nrow = 1, byrow=TRUE))
+       )
+if (save.it) dev.off()
+
+
+df.t$db <- factor(df.t$db, c("msigdb-h", "kegg", "wikipathways", "reactome", "go", "mousecyc"))
+if (save.it) png("P2_outputs/summary_statistics/E1-B Proportion db univariate db hyp.png",
+                 width = 7, height = 4.35, units = 'in', res = 400)
+print( ggplot(df.t, aes(x=db, y=prop.len, fill=method)) +
+         # paletteer::scale_fill_paletteer_d("PNWColors::Sailboat", direction=-1) + 
+         # paletteer::scale_fill_paletteer_d("ghibli::PonyoMedium", direction=-1) +
+         # paletteer::scale_fill_paletteer_d("MetBrewer::VanGogh2") +
+         scale_fill_manual(values=c(paletteer_d("MetBrewer::Cassatt1")[c(1:4)],
+                                    "#FCFBF4",
+                                    # paletteer_d("MetBrewer::Morgenstern")[c(1:4)])) +
+                                    paletteer_d("musculusColors::Bmsurface")[c(2:4)])) +
+         # scale_fill_manual(values=c(# paletteer_d("palettetown::ditto")[c(3:1, 6)],
+         #                            paletteer_d("colorBlindness::Blue2DarkRed12Steps")[c(8:11)],
+         #                            # "#DBEFF9FF",
+         #                            paletteer_d("colorBlindness::ModifiedSpectralScheme11Steps")[c(7:10)])) +
+         # facet_wrap(~hyp, scale="free") +
+         geom_boxplot(outlier.shape = NA) + coord_cartesian(ylim = c(0, 50)) +
+         labs(title="Proportion of Genesets Enriched", subtitle="n = 6",
+              x="Enrichment Method", y="Genesets Considered Enriched (%)") +
+         theme.global + 
+         theme(plot.title=element_blank()) + guides(fill=guide_legend(nrow = 2, byrow=TRUE))
+       )
+if (save.it) dev.off()
+
+rm(df.t)
+
+```
+
+```{r}
+df.ssc$method2 <- df.ssc$method
+df.ssc$method2 <- factor(df.ssc$method2, c("OTHER", "ROAST",  "PLAGE"))
+df.ssc$method2[df.ssc$method=="GSVA"] <- "OTHER"
+df.ssc$method2[df.ssc$method=="GLOBALTEST"] <- "OTHER"
+df.ssc$method2[df.ssc$meth.type=="Univariate"] <- "OTHER"
+
+if (save.it) png("P2_outputs/summary_statistics/E1-B Proportion db 3 univariate hyp.png",
+                 width = 4, height = 6, units = 'in', res = 400)
+print( ggplot(df.ssc, aes(x=method2, y=prop.len, fill=db)) +
+         paletteer::scale_fill_paletteer_d("feathers::galah") +
+         geom_boxplot(outlier.colour=NA) + coord_cartesian(ylim = c(0, 100)) +
+         labs(title="Proportion of Genesets Enriched", subtitle="n = [54, 6, 6]",
+              x="Enrichment Method", y="Genesets Considered Enriched (%)") +
+         theme.global + guides(fill=guide_legend(nrow = 2, byrow=TRUE))
+       )
+if (save.it) dev.off()
+
+df.ssc <- df.ssc[, -c(which(colnames(df.ssc) %in% "method2"))]
+```
+
+```{r include=FALSE} 
+# if (save.it) png("P2_outputs/summary_statistics/E1-B Proportion db 2.png",
+#                  width = 7, height = 8, units = 'in', res = 400) 
+# 
+# # Plot the spread of the proportion of genesets found to be differentially enriched.
+# print( ggplot(df.ssc, aes(x=method, y=prop.len, fill=db)) +
+#          paletteer::scale_fill_paletteer_d("feathers::galah") + facet_wrap(~db, scale="free") +
+#          geom_boxplot() + coord_cartesian(ylim = c(0, 100)) + 
+#          labs(title="Proportion of Genesets Enriched", subtitle="n = 66",
+#               x="Enrichment Method", y="Genesets Considered Enriched (%)") + 
+#          theme.global + guides(fill=guide_legend(nrow = 1))
+#        )
+# 
+# if (save.it) dev.off()
+```
+
+
+
+
+### E1 GS Sizes
+
+```{r}
+# Because the E1-A and E1-B showed that GSEA and GlobalTest returned (next to no) genesets.
+# df.pws <- df.pws[!(df.pws$method %in% c("GSEA", "GLOBATLTEST")), ]
+df.pws <- df.pws[!(df.pws$method %in% c("GSEA", "GLOBALTEST")), ]
+df.pws$method <- factor(df.pws$method, method.names[method.names %in% unique(df.pws$method)])
+pw.df <- df.pws
+```
+
+```{r include=FALSE} 
+# Cropping stuff so the y-axis is nicely spread.
+bound.u <- -10000000
+bound.d <-  10000000
+for (db in reg.list)
+{
+  temp <- quantile(df.pws[df.pws$ds == db, "length"], c(0.1, 0.9))
+  bound.u <- max(bound.u, temp[2]  )
+  bound.d <- min(bound.d, temp[1]-5)
+  rm(temp)
+}
+```
+
+```{r}
+# 
+# df.pws$method <- factor(df.pws$method, c("ORA", "MRGSE", "CAMERAv2", "CAMERAv1",
+#                                             "GSA", "PADOG", "GSVA", "ROAST", "PLAGE"))
+# 
+# if (save.it) png("P2_outputs/summary_statistics/E1-C GS Sizes.png",
+#                  width = 6, height = 3, units = 'in', res = 400)
+#   print( ggplot(df.pws, aes(x=method, y=length, fill=method)) +
+#            geom_violin(alpha=0.25,) +
+#            geom_boxplot(width=0.2, outlier.shape = NA) + 
+#            scale_y_continuous(limits=c(bound.d, bound.u)) + #facet_wrap(~exp, scale="free") +
+#            labs(title="Size of Enriched Genesets", 
+#                 x="Enrichment Method", y="Number of Genes") +
+#            theme.global + guides(fill=FALSE)
+#          )
+# if (save.it) dev.off()
+#   
+# df.pws$method <- factor(df.pws$method, method.names[method.names %in% unique(df.pws$method)])
+  
+```
+
+```{r}
+
+if (save.it) png("P2_outputs/summary_statistics/E1-C GS Sizes 1 full.png",
+                 width = 7, height = 3, units = 'in', res = 400)
+# Plot the spread of the proportion of genesets found to be differentially enriched.
+
+# print( ggplot(df.dbs, aes(x=db, y=NR.GENES, fill=db)) +
+#            scale_fill_manual(values=paletteer_d("feathers::galah")[c(7,1:6)]) +
+print( ggplot(df.dbs[df.dbs$db!="all",], aes(x=db, y=NR.GENES, fill=db)) +
+           scale_fill_manual(values=paletteer_d("feathers::galah")) +
+           geom_violin(alpha=0.25,) +
+           geom_boxplot(width=0.1, outlier.shape = NA) + 
+           scale_y_continuous(limits=c(bound.d, bound.u)) + #facet_wrap(~exp, scale="free") +
+           labs(title="Size of All Genesets", 
+                x="Databases", y="Number of Genes") +
+           theme.global + guides(fill=guide_legend(nrow = 1)) +
+           theme(axis.text.x=element_blank())
+         )
+if (save.it) dev.off()
+
+```
+
+```{r include=FALSE} 
+# 
+# if (save.it) png("P2_outputs/summary_statistics/E1-C GS Sizes exp.ds 1.png",
+#                  width = 9, height = 5, units = 'in', res = 400)
+#   print( ggplot(df.pws, aes(x=method, y=length, fill=exp.ds)) +
+#            # paletteer::scale_fill_paletteer_d("ggthemes::excel_Green") +
+#            # scale_fill_manual(values=c("#0989B1FF", "#4BACC6FF", "#4AB5C4FF",  "#549E39FF", "#8AB833FF", "#C0CF3AFF")) +
+#            # paletteer::scale_fill_paletteer_d("ggthemes::excel_Red_Orange") +
+#            scale_fill_manual(values=c("#B64926FF", "#E84C22FF", "#FF8427FF", "#549E39FF", "#8AB833FF", "#C0CF3AFF")) +
+#            #geom_violin(alpha=0.25) +
+#            geom_boxplot(outlier.shape = NA) + 
+#            scale_y_continuous(limits=c(bound.d, bound.u)) + #facet_wrap(~exp, scale="free") +
+#            labs(title="Size of Enriched Genesets", 
+#                 x="Enrichment Method", y="Number of Genes") +
+#            theme.global + guides(fill=guide_legend(nrow = 2, byrow=TRUE))
+#          )
+# if (save.it) dev.off()
+
+```
+
+```{r include=FALSE} 
+# df.pws$nothing <- "Hypothesis"
+# plot1 <- ( ggplot(df.pws, aes(x=hyp, y=length, fill=exp.ds)) +
+#          scale_fill_manual(values=c("#B64926FF", "#E84C22FF", "#FF8427FF", "#549E39FF", "#8AB833FF", "#C0CF3AFF")) +
+#          geom_boxplot(outlier.shape = NA) + 
+#          scale_y_continuous(limits=c(bound.d, bound.u)) + facet_wrap(~nothing, scale="free") +
+#          labs(x="Enrichment Method", y="Number of Genes") +
+#          theme.global + guides(fill=guide_legend(nrow = 2, byrow=TRUE))
+#        )
+# 
+# df.pws$nothing <- "Type of Method"
+# plot2 <- ( ggplot(df.pws, aes(x=meth.type, y=length, fill=exp.ds)) +
+#          scale_fill_manual(values=c("#B64926FF", "#E84C22FF", "#FF8427FF", "#549E39FF", "#8AB833FF", "#C0CF3AFF")) +
+#          geom_boxplot(outlier.shape = NA) + 
+#          scale_y_continuous(limits=c(bound.d, bound.u)) + facet_wrap(~nothing, scale="free") +
+#          labs(x="Enrichment Method", y="Number of Genes") +
+#          theme.global + guides(fill=guide_legend(nrow = 2, byrow=TRUE))
+#        )
+# 
+# if (save.it) png("P2_outputs/summary_statistics/E1-C GS Sizes exp.ds 1.5 hyp and meth_type.png",
+#                  width = 8, height = 5, units = 'in', res = 400)
+# guide_area() + (plot1 + plot2) +
+#   plot_layout(guides = "collect", nrow = 2, heights = c(1,10)) +
+#   plot_annotation(title="Size of Enriched Genesets") & 
+#   theme(legend.position = "top",
+#         legend.box.margin=margin(0, 30, 10, 0),
+#         plot.title = element_text(hjust = 0.5),
+#         plot.subtitle = element_text(hjust = 0.5))
+# if (save.it) dev.off()
+# 
+# rm(plot1, plot2)
+
+```
+
+```{r include=FALSE} 
+
+# df.t <- df.pws[df.pws$meth.type=="Univariate" | df.pws$method=="GSVA", ]
+# df.t$method <- factor(df.t$method, c(c("ORA", "MRGSE", "CAMERAv1", "CAMERAv2",
+#                                      "GSA", "PADOG", "GSVA", "GSEA")))
+df.t <- df.pws
+df.t$method <- factor(df.t$method, c("ORA", "MRGSE", "CAMERAv2", "CAMERAv1",
+                                            "GSA", "PADOG", "GSVA", "ROAST", "PLAGE"))
+df.t[df.t$hyp!="Q1", "hyp"] <- "Self-Contained and Hybrid"
+df.t[df.t$hyp=="Q1", "hyp"] <- "Competitive"
+df.t[df.t$method %in% c("ROAST", "PLAGE"), "hyp"] <- "Many Genesets"
+df.t$hyp <- factor(df.t$hyp, c("Competitive", "Self-Contained and Hybrid", "Many Genesets"))
+
+if (save.it) png("P2_outputs/summary_statistics/E1-C GS Sizes exp_ds 2.png",
+#if (save.it) png("P2_outputs/summary_statistics/E1-C GS Sizes exp_ds 2b.png",
+                 width = 7, height = 4, units = 'in', res = 400)
+# Plot the spread of the proportion of genesets found to be differentially enriched.
+print( ggplot(df.t, aes(x=method, y=length, fill=exp.ds)) +
+         scale_fill_manual(values=c("#B64926FF", "#E84C22FF", "#FF8427FF", "#549E39FF", "#8AB833FF", "#C0CF3AFF")) +
+         #facet_wrap(~hyp, scale="free") +
+         facet_grid(~hyp, scale="free_x", space = "free_x") +
+         geom_boxplot(outlier.shape = NA) + scale_y_continuous(limits=c(bound.d, bound.u)) + 
+         labs(title="Size of Enriched Genesets", 
+              x="Enrichment Method", y="Number of Genes") +
+         theme.global + guides(fill=guide_legend(nrow = 2, byrow=TRUE))
+       )
+if (save.it) dev.off()
+
+
+# if (save.it) png("P2_outputs/summary_statistics/E1-C GS Sizes exp_ds univariate db.png",
+#                  width = 8, height = 5, units = 'in', res = 400)
+# print( ggplot(df.t, aes(x=db, y=length, fill=exp.ds)) +
+#          scale_fill_manual(values=c("#B64926FF", "#E84C22FF", "#FF8427FF", "#549E39FF", "#8AB833FF", "#C0CF3AFF")) +
+#          # facet_wrap(~hyp, scale="free") +
+#          geom_boxplot() + scale_y_continuous(limits=c(bound.d, bound.u)) +
+#          labs(title="Size of Enriched Genesets",
+#               x="Enrichment Method", y="Number of Genes") +
+#          theme.global + guides(fill=guide_legend(nrow = 2, byrow=TRUE))
+#        )
+# if (save.it) dev.off()
+
+rm(df.t)
+
+```
+
+```{r}
+
+# # df.ssc$meth.type[df.ssc$method=="GLOBALTEST"] <- "Multivariate"
+# df.t <- df.ssc[df.ssc$meth.type=="Univariate" | df.ssc$method=="GSVA", ]
+# df.t$method <- factor(df.t$method, c(c("ORA", "MRGSE", "CAMERAv1", "CAMERAv2",
+#                                     "GSVA", "GSA", "PADOG", "GSEA")))
+# df.t[df.t$hyp!="Q1", "hyp"] <- "Self-Contained and Hybrid"
+# df.t[df.t$hyp=="Q1", "hyp"] <- "Competitive"
+# 
+# 
+# if (save.it) png("P2_outputs/summary_statistics/E1-B Proportion db univariate db hyp.png",
+#                  width = 7, height = 5, units = 'in', res = 400)
+# print( ggplot(df.t, aes(x=db, y=prop.len, fill=method)) +
+#          # paletteer::scale_fill_paletteer_d("PNWColors::Sailboat", direction=-1) + 
+#          # paletteer::scale_fill_paletteer_d("ghibli::PonyoMedium", direction=-1) +
+#          # paletteer::scale_fill_paletteer_d("MetBrewer::VanGogh2") +
+#          scale_fill_manual(values=c(paletteer_d("MetBrewer::Cassatt1")[c(1:4)],
+#                                     "#FCFBF4",
+#                                     # paletteer_d("MetBrewer::Morgenstern")[c(1:4)])) +
+#                                     paletteer_d("musculusColors::Bmsurface")[c(2:4)])) +
+#          # scale_fill_manual(values=c(# paletteer_d("palettetown::ditto")[c(3:1, 6)],
+#          #                            paletteer_d("colorBlindness::Blue2DarkRed12Steps")[c(8:11)],
+#          #                            # "#DBEFF9FF",
+#          #                            paletteer_d("colorBlindness::ModifiedSpectralScheme11Steps")[c(7:10)])) +
+#          # facet_wrap(~hyp, scale="free") +
+#          geom_boxplot(outlier.shape = NA) + coord_cartesian(ylim = c(0, 50)) +
+#          labs(title="Proportion of Genesets Enriched", subtitle="n = 6",
+#               x="Enrichment Method", y="Genesets Considered Enriched (%)") +
+#          theme.global + guides(fill=guide_legend(nrow = 2, byrow=TRUE))
+#        )
+# if (save.it) dev.off()
+# 
+# rm(df.t)
+
+```
+
+```{r}
+
+# df.t <- df.pws[df.pws$meth.type=="Univariate" | df.pws$method=="GSVA", ]
+# df.t$method <- factor(df.t$method, c(c("ORA", "MRGSE", "CAMERAv1", "CAMERAv2",
+#                                     "GSVA", "GSA", "PADOG", "GSEA")))
+# # df.t <- df.pws[df.pws$method!="GLOBALTEST" | df.pws$method=="GSEA", ]
+# # df.t$method <- factor(df.t$method, c(c("ORA", "MRGSE", "CAMERAv1", "CAMERAv2",
+# #                                     "GSVA", "GSA", "PADOG", "ROAST", "PLAGE")))
+# df.t$db <- factor(df.t$db, c("msigdb-h", "kegg", "wikipathways", "reactome", "go", "mousecyc"))
+# 
+# 
+# if (save.it) png("P2_outputs/summary_statistics/E1-C GS Sizes univariate db hyp 1.png",
+#                  width = 8, height = 5, units = 'in', res = 400)
+# print( ggplot(df.t, aes(x=db, y=length, fill=method)) +
+#           scale_fill_manual(values=c(paletteer_d("MetBrewer::Cassatt1")[c(1:4)],
+#                                     "#FCFBF4",
+#                                     paletteer_d("musculusColors::Bmsurface")[c(2:3)]#,
+#                                     # "#E7D4E8FF", "#C2A5CFFF"
+#                                     )) +
+#          geom_boxplot(outlier.shape = NA) + scale_y_continuous(limits=c(bound.d, bound.u)) +
+#          # facet_wrap(~nothing, scale="free") +
+#          labs(title="Size of Enriched Genesets",
+#               x="Database", y="Number of Genes") +
+#          theme.global + guides(fill=guide_legend(nrow = 2, byrow=TRUE))
+#        )
+# if (save.it) dev.off()
+
+
+
+# df.t <- df.t[(df.t$method!="PLAGE" | df.t$method!="ROAST"), ]
+# df.t$db <- factor(df.t$db, c( "wikipathways", "msigdb-h", "kegg", "go", "mousecyc", "reactome"))
+# 
+# df.t[df.t$hyp!="Q1", "hyp"] <- "Self-Contained and Hybrid"
+# df.t[df.t$hyp=="Q1", "hyp"] <- "Competitive"
+# #df.t[df.t$method=="PLAGE" | df.t$method=="ROAST", "hyp"] <- "Large Genesets"
+# df.t$hyp <- factor(df.t$hyp, c("Competitive", "Self-Contained and Hybrid", "Large Genesets"))
+# 
+# df.t[df.t$db %in% c("go", "mousecyc", "reactome"), "nothing"] <- "Bottom Heavy"
+# df.t[df.t$nothing!="Bottom Heavy", "nothing"] <- "Tapering Uniform"
+# #df.t$nothing <- factor(df.t$nothing, c("Tapering Uniform", "Bottom Heavy"))
+# 
+# 
+# if (save.it) png("P2_outputs/summary_statistics/E1-C GS Size db univariate db hyp 2.png",
+#                  width = 6, height = 4, units = 'in', res = 400)
+# print( ggplot(df.t, aes(x=db, y=length, fill=hyp)) +
+#           scale_fill_manual(values=c("#FEA19EFF", "#B9E5F3FF", "#F5F5F5FF")) +
+#          geom_boxplot(outlier.shape = NA) + scale_y_continuous(limits=c(bound.d, bound.u)) +
+#          facet_wrap(~nothing, scale="free") +
+#          labs(title="Size of Enriched Genesets",
+#               x="Database", y="Number of Genes") +
+#          theme.global + guides(fill=guide_legend(nrow = 1, byrow=TRUE))
+#        )
+# if (save.it) dev.off()
+# 
+# 
+# df.t <- df.t[(df.t$method!="ORA"), ]
+# if (save.it) png("P2_outputs/summary_statistics/E1-C GS Size db univariate db hyp 3.png",
+#                  width = 6, height = 4, units = 'in', res = 400)
+# print( ggplot(df.t, aes(x=db, y=length, fill=hyp)) +
+#           scale_fill_manual(values=c("#FEA19EFF", "#B9E5F3FF", "#F5F5F5FF")) +
+#          geom_boxplot(outlier.shape = NA) + scale_y_continuous(limits=c(bound.d, bound.u)) +
+#          facet_wrap(~nothing, scale="free") +
+#          labs(title="Size of Enriched Genesets",
+#               x="Database", y="Number of Genes") +
+#          theme.global + guides(fill=guide_legend(nrow = 1, byrow=TRUE))
+#        )
+# if (save.it) dev.off()
+
+# rm(df.t)
+
+```
+
+
+
+``` {r}
+
+# df.pws$method <- factor(df.pws$method, c("ORA", "MRGSE", "CAMERAv2", "CAMERAv1",
+#                                             "GSA", "PADOG", "GSVA", "ROAST", "PLAGE"))
+# 
+# if (save.it) png("P2_outputs/summary_statistics/E1-C GS Sizes exp_ds competitive 1.png",
+#                  width = 9, height = 6, units = 'in', res = 400)
+# print( ggplot(df.pws[df.pws$method %in% c("ORA", "MRGSE", "CAMERAv1", "CAMERAv2"), ], aes(x=exp, y=length, fill=exp.ds)) +
+# #print( ggplot(df.pws, aes(x=exp, y=length, fill=exp.ds)) +
+#          # scale_fill_manual(values=c("#B64926FF", "#E84C22FF", "#FF8427FF", "#549E39FF", "#8AB833FF", "#C0CF3AFF")) +
+#          # paletteer::scale_fill_paletteer_d("fishualize::Pseudocheilinus_tetrataenia")  +
+#          scale_fill_manual(values=paletteer_d("ggthemes::Summer")[c(3,5,7, 4,6,8)]) +
+#          # geom_violin(alpha=0.25) +
+#          geom_violin() +
+#          #geom_boxplot(outlier.shape = NA) + 
+#          scale_y_continuous(limits=c(bound.d, bound.u)) + facet_wrap(~method, scale="free") +
+#          labs(title="Size of Enriched Genesets",
+#               x="Enrichment Method", y="Number of Genes") +
+#          #theme.global + 
+#          theme(axis.title.x=element_blank(),
+#                       legend.title=element_blank(),
+#                       legend.position = "top", 
+#                       plot.title = element_text(hjust = 0.5),
+#                       plot.subtitle = element_text(hjust = 0.5)) +
+#          guides(fill=guide_legend(nrow = 2, byrow=TRUE))
+#        )
+# if (save.it) dev.off()
+# 
+# df.pws$method <- factor(df.pws$method, method.names[method.names %in% unique(df.pws$method)])
+
+```
+
+```{r}
+
+df.t <- df.pws
+df.t$method <- factor(df.t$method, c("ORA", "MRGSE", "CAMERAv2", "CAMERAv1",
+                                            "GSA", "PADOG", "GSVA", "ROAST", "PLAGE"))
+df.t[df.t$hyp!="Q1", "hyp"] <- "Self-Contained and Hybrid"
+df.t[df.t$hyp=="Q1", "hyp"] <- "Competitive"
+df.t[df.t$method %in% c("ROAST", "PLAGE"), "hyp"] <- "Many Genesets"
+df.t$hyp <- factor(df.t$hyp, c("Competitive", "Self-Contained and Hybrid", "Many Genesets"))
+
+
+# if (save.it) png("P2_outputs/summary_statistics/E1-C GS Sizes exp_ds competitive 2.png",
+#                  width = 9, height = 6, units = 'in', res = 400)
+# print( ggplot(df.t, aes(x=exp, y=length, fill=exp.ds)) +
+# #print( ggplot(df.pws, aes(x=exp, y=length, fill=exp.ds)) +
+#          # scale_fill_manual(values=c("#B64926FF", "#E84C22FF", "#FF8427FF", "#549E39FF", "#8AB833FF", "#C0CF3AFF")) +
+#          # paletteer::scale_fill_paletteer_d("fishualize::Pseudocheilinus_tetrataenia")  +
+#          scale_fill_manual(values=paletteer_d("ggthemes::Summer")[c(3,5,7, 4,6,8)]) +
+#          # paletteer::scale_fill_paletteer_d("feathers::galah") +
+#          # geom_violin(alpha=0.25) +
+#          geom_violin() +
+#          #geom_boxplot(outlier.shape = NA) + 
+#          scale_y_continuous(limits=c(bound.d, bound.u)) + 
+#          facet_wrap(~method, scale="free") +
+#          labs(title="Size of Enriched Genesets",
+#               x="Enrichment Method", y="Number of Genes") +
+#          #theme.global + 
+#          theme(axis.title.x=element_blank(),
+#                       legend.title=element_blank(),
+#                       legend.position = "top", 
+#                       plot.title = element_text(hjust = 0.5),
+#                       plot.subtitle = element_text(hjust = 0.5)) +
+#          guides(fill=guide_legend(nrow = 2, byrow=TRUE))
+#        )
+# if (save.it) dev.off()
+
+# 
+# if (save.it) png("P2_outputs/summary_statistics/E1-C GS Sizes exp_ds competitive 3.png",
+#                  width = 8, height = 3, units = 'in', res = 400)
+# print( ggplot(df.t[df.t$method %in% c("ORA", "MRGSE", "CAMERAv1", "CAMERAv2"), ], aes(x=db, y=length, fill=db)) +
+#          paletteer::scale_fill_paletteer_d("feathers::galah") +
+#          # geom_violin(alpha=0.25) +
+#          geom_violin() +
+#          #geom_boxplot(outlier.shape = NA) + 
+#          scale_y_continuous(limits=c(bound.d, bound.u)) + 
+#          facet_grid(~method, scale="free") +
+#          labs(title="Size of Enriched Genesets",
+#               x="Enrichment Method", y="Number of Genes") +
+#          theme.global + 
+#          theme(axis.text.x=element_blank(),
+#                #axis.title.x=element_blank(),
+#                       legend.title=element_blank(),
+#                       legend.position = "top", 
+#                       plot.title = element_text(hjust = 0.5),
+#                       plot.subtitle = element_text(hjust = 0.5)) +
+#          guides(fill=guide_legend(nrow = 1, byrow=TRUE))
+#        )
+# if (save.it) dev.off()
+
+df.t$method <- factor(df.t$method, c("ORA", "CAMERAv2", "GSA", "MRGSE", "CAMERAv1", "PLAGE",
+                                     "PADOG", "GSVA", "ROAST"))
+if (save.it) png("P2_outputs/summary_statistics/E1-C GS Sizes exp_ds competitive 4.png",
+                 width = 8, height = 4, units = 'in', res = 400)
+print( ggplot(df.t[df.t$method %in% c("ORA", "MRGSE", "CAMERAv1", "CAMERAv2", "GSA", "PLAGE"), ], aes(x=db, y=length, fill=db)) +
+  
+         paletteer::scale_fill_paletteer_d("feathers::galah") +
+         # geom_violin(alpha=0.25) +
+         geom_violin() +
+         #geom_boxplot(outlier.shape = NA) + 
+         scale_y_continuous(limits=c(bound.d, bound.u)) + 
+         facet_wrap(~method, scale="free") +
+         labs(title="Size of Enriched Genesets",
+              x="Enrichment Method", y="Number of Genes") +
+         theme.global + 
+         theme(axis.text.x=element_blank(),
+               plot.title=element_blank(),
+                      legend.title=element_blank(),
+                      legend.position = "top", 
+                      # plot.title = element_text(hjust = 0.5),
+                      plot.subtitle = element_text(hjust = 0.5)) +
+         guides(fill=guide_legend(nrow = 1, byrow=TRUE))
+       )
+if (save.it) dev.off()
+
+
+
+# df.t$method <- factor(df.t$method, c("ORA", "MRGSE", "CAMERAv2", "CAMERAv1",
+#                                             "GSA", "PADOG", "GSVA", "ROAST", "PLAGE"))
+# if (save.it) png("P2_outputs/summary_statistics/E1-C GS Sizes db.png",
+#                  width = 9, height = 6, units = 'in', res = 400)
+# print( ggplot(df.t, aes(x=exp, y=length, fill=db)) +
+#          paletteer::scale_fill_paletteer_d("feathers::galah") +
+#          # geom_violin(alpha=0.25) +
+#          geom_violin() +
+#          #geom_boxplot(outlier.shape = NA) + 
+#          scale_y_continuous(limits=c(bound.d, bound.u)) + 
+#          facet_wrap(~method, scale="free") +
+#          labs(title="Size of Enriched Genesets",
+#               x="Enrichment Method", y="Number of Genes") +
+#          #theme.global + 
+#          theme(axis.title.x=element_blank(),
+#                       legend.title=element_blank(),
+#                       legend.position = "top", 
+#                       plot.title = element_text(hjust = 0.5),
+#                       plot.subtitle = element_text(hjust = 0.5)) +
+#          guides(fill=guide_legend(nrow = 2, byrow=TRUE))
+#        )
+# if (save.it) dev.off()
+
+rm(df.t)
+
+```
+
+```{r}
+# 
+# if (save.it) png("P2_outputs/summary_statistics/E1-C GS Sizes db ds.png",
+#                  width = 8, height = 3, units = 'in', res = 400)
+# print( ggplot(df.pws, aes(x=db, y=length, fill=ds)) +
+#          paletteer::scale_fill_paletteer_d("Redmonder::dPBIYlPu") +
+#          # geom_violin(alpha=0.25) +
+#          geom_violin() +
+#          #geom_boxplot(outlier.shape = NA) + 
+#          scale_y_continuous(limits=c(bound.d, bound.u)) + 
+#          # facet_wrap(~method, scale="free") +
+#          labs(title="Size of Enriched Genesets",
+#               x="Experiment", y="Number of Genes") +
+#          theme.global + 
+#          theme(axis.text.x=element_text(angle = 0, vjust = 0.5, hjust = 0.5)) +
+#          guides(fill=guide_legend(nrow = 1, byrow=TRUE))
+#        )
+# if (save.it) dev.off()
+
+```
+
+
+
+
+
+
+
+
+``` {r}
+# 
+# if (save.it) png("P2_outputs/summary_statistics/E1-C GS Sizes exp_ds univariate db 1.png",
+#                  width = 10, height = 5, units = 'in', res = 400)
+# print( ggplot(df.pws[df.pws$method %in% c("ORA", "MRGSE", "CAMERAv1", "CAMERAv2"), ], aes(x=method, y=length, fill=ds)) +
+#          # scale_fill_manual(values=c("#B64926FF", "#E84C22FF", "#FF8427FF", "#549E39FF", "#8AB833FF", "#C0CF3AFF")) +
+#          # paletteer::scale_fill_paletteer_d("fishualize::Pseudocheilinus_tetrataenia")  +
+#          # scale_fill_manual(values=paletteer_d("fishualize::Salmo_trutta")[c(1,2,4)]) +
+#          scale_fill_manual(values=c("#F7F7F7FF", "#E6452EFF", "#93745CFF")) +
+#          #geom_violin(alpha=0.25) +
+#          geom_boxplot(outlier.shape = NA) + scale_y_continuous(limits=c(bound.d, bound.u)) + 
+#          facet_wrap(~db, scale="free") +
+#          labs(title="Size of Enriched Genesets",
+#               x="Enrichment Method", y="Number of Genes") +
+#          theme.global + guides(fill=guide_legend(nrow = 1))
+#        )
+# if (save.it) dev.off()
+
+```
+
+
+```{r include=FALSE} 
+# Plot showing the spread of enriched genesets sizes.
+# if (save.it) png("P2_outputs/summary_statistics/E1-C GS Sizes method.png", 
+#                  width = 12, height = 5, units = 'in', res = 400)
+# 
+#  print( ggplot(df.pws, aes(x=ds, y=length, fill=db)) +
+#            # paletteer::scale_fill_paletteer_d("ggthemes::excel_Slipstream", direction=-1) +
+#            scale_fill_manual(values=c(paletteer_d("beyonce::X44")[c(1,4,3)],
+#                                       paletteer_d("Redmonder::dPBIRdBu")[c(10,7,9)])) +
+#            geom_boxplot(outlier.shape = NA) + 
+#            scale_y_continuous(limits=c(bound.d, bound.u)) + facet_wrap(~method, scale="free", nrow=2, ncol=5) +
+#            labs(title=paste0("Size of Enriched Genesets"),
+#                 x="Enrichment Method", y="Number of Genes") +
+#            theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+#                  axis.title.x=element_blank(),
+#                  legend.title=element_blank(),
+#                  legend.position = "top", 
+#                  
+#                plot.title = element_text(hjust = 0.5),
+#                plot.subtitle = element_text(hjust = 0.5)) +
+#            guides(fill=guide_legend(nrow = 1))
+#  )
+# 
+# if (save.it) dev.off()
+```
+
+
+```{r}
+# hist(df.dbs$NR.GENES)
+# hist(df.pws$length)
+```
+
+
+
+
+
+
+
+
+### E2 Correlation
+
+#### scatter plots
+
+```{r}
+# df.corr <- df.corr[!(df.corr$method %in% c("ORA", "GSEA", "GLOBALTEST")), ]
+# df.corr$method <- factor(df.corr$method, c("MRGSE", "CAMERAv1", "CAMERAv2",
+#                                             "GSA", "PADOG", "ROAST", "GSVA", "PLAGE"))
+# df.corr$method.db <- factor(df.corr$method.db, paste0(rep(method.names[method.names %in% df.corr$method], 
+#                                                             each=length(db.list)),  sep.v, db.list))
+```
+
+```{r}
+
+if (save.it) png("P2_outputs/summary_statistics/E2-A Correlations scatter graph 1 q value.png", 
+                 width = 10, height = 15, units = 'in', res = 200)
+
+print( ggplot(df.corr, aes(x=x.q, y=y.q)) +
+         geom_point(alpha=0.1) + 
+         geom_smooth(method=lm , color="red", fill="green", linewidth=2, se=TRUE) +
+         coord_cartesian(ylim = c(0, 1), xlim = c(0, 1)) + 
+         facet_wrap(~method.db, scale="free", ncol=6) +
+         #labs(title="Correlation between Q-values", subtitle="(Mixed Dataset)", 
+         #    x="Apoptosis Q-values", y="CICD Q-values") +
+         theme.global + 
+         theme(aspect.ratio = 1,
+               axis.text = element_blank(),
+               axis.text.x = element_blank(),
+               axis.ticks = element_blank()) +
+         guides(colour = guide_legend(override.aes = list(alpha = 1)))
+         )
+
+if (save.it) dev.off()
+
+```
+
+``` {r}
+
+# if (save.it) png("P2_outputs/summary_statistics/E2-A Correlations scatter graph 1 giant cropped.png",
+#                  width = 10, height = 18, units = 'in', res = 400)
+# 
+# x.cutoff <- 0.1
+# y.cutoff <- 0.1
+# 
+# # Add a dummy entry to maintain the order of the facets.
+# # Only add it to the empty method.db combos to prevent the geom_smooth line being drawn accidentally.
+# df.t <- df.corr[df.corr$x.q<=x.cutoff & df.corr$y.q<=y.cutoff, ]
+# for (i in unique(df.corr$method.db)[!(unique(df.corr$method.db) %in% unique(df.t$method.db))])
+# {
+#   df.t <- rbind(df.t, NA)
+#   df.t[nrow(df.t), "x.q"] <- 1
+#   df.t[nrow(df.t), "y.q"] <- 1
+#   df.t[nrow(df.t), "method.db"] <- i
+# }
+#   
+# 
+# #print( ggplot(df.corr[df.corr$method=="ORA" & df.corr$db=="kegg", ], aes(x=x, y=y, fill=db)) +
+# print( ggplot(df.t, aes(x=x.q, y=y.q)) +
+#          geom_point(alpha=0.1) +
+#          geom_smooth(method=lm , color="red", fill="green", weight=6, se=TRUE) +
+#          coord_cartesian(ylim = c(0, y.cutoff), xlim = c(0, x.cutoff)) +
+#          facet_wrap(~method.db, scale="free", ncol=6, drop=FALSE) +
+#          labs(title="Correlation between Q-values Equal to and Lower than 0.1", subtitle="(Mixed Dataset)",
+#               x="Apoptosis Q-values", y="CICD Q-values") +
+#          theme.global +
+#          theme(aspect.ratio = 1,
+#                axis.text = element_blank(),
+#                axis.ticks = element_blank())
+#          )
+# 
+# if (save.it) dev.off()
+# 
+# rm(df.t)
+
+```
+
+```{r}
+
+if (save.it) png("P2_outputs/summary_statistics/E2-A Correlations scatter graph 1 q value log2.png", 
+                 width = 10, height = 15, units = 'in', res = 200)
+
+print( ggplot(df.corr, aes(x=x.t.q, y=y.t.q)) +
+         geom_point(alpha=0.1) + 
+         geom_smooth(method=lm , color="orange", fill="blue", linewidth=3, se=TRUE) +
+         #coord_cartesian(ylim = c(0, 1), xlim = c(0, 1)) + 
+         facet_wrap(~method.db, scale="free", ncol=6) +
+         #labs(title="Correlation between Log2-transformed Q-values", subtitle="(Mixed Dataset)", 
+         #     x="Apoptosis Q-values", y="CICD Q-values") +
+         theme.global + 
+         theme(aspect.ratio = 1,
+               axis.text = element_blank(),
+               axis.text.x = element_blank(),
+               axis.ticks = element_blank()) +
+         guides(colour = guide_legend(override.aes = list(alpha = 1)))
+         )
+
+if (save.it) dev.off()
+
+```
+
+``` {r}
+
+# if (save.it) png("P2_outputs/summary_statistics/E2-A Correlations scatter graph 1 q value log2 cropped.png", 
+#                  width = 10, height = 18, units = 'in', res = 400)
+# 
+# x.cutoff <- 0.1
+# y.cutoff <- 0.1
+# 
+# # Add a dummy entry to maintain the order of the facets.
+# # Only add it to the empty method.db combos to prevent the geom_smooth line being drawn accidentally.
+# df.t <- df.corr[df.corr$x.q<=x.cutoff & df.corr$y.q<=y.cutoff, ]
+# for (i in unique(df.corr$method.db)[!(unique(df.corr$method.db) %in% unique(df.t$method.db))])
+# {
+#   df.t <- rbind(df.t, NA)
+#   df.t[nrow(df.t), "x.q"] <- 1
+#   df.t[nrow(df.t), "y.q"] <- 1
+#   df.t[nrow(df.t), "method.db"] <- i
+# }
+# 
+# 
+# #print( ggplot(df.corr[df.corr$method=="ORA" & df.corr$db=="kegg", ], aes(x=x, y=y, fill=db)) +
+# print( ggplot(df.t, aes(x=x.t.q, y=y.t.q)) +
+#          geom_point(alpha=0.1) +
+#          geom_smooth(method=lm , color="red", fill="green", weight=6, se=TRUE) +
+#          #coord_cartesian(ylim = c(0, y.cutoff), xlim = c(0, x.cutoff)) +
+#          facet_wrap(~method.db, scale="free", ncol=6, drop=FALSE) +
+#          labs(title="Correlation between Log2-transformed Q-values Equal to and Lower than 0.1", subtitle="(Mixed Dataset)",
+#               x="Apoptosis Q-values", y="CICD Q-values") +
+#          theme.global +
+#          theme(aspect.ratio = 1,
+#                axis.text = element_blank(),
+#                axis.ticks = element_blank())
+#          )
+# 
+# if (save.it) dev.off()
+# 
+# rm(df.t)
+
+```
+
+```{r}
+
+# if (save.it) png("P2_outputs/summary_statistics/E2-A Correlations scatter graph 2 kegg.png",
+#                  width = 10, height = 6, units = 'in', res = 400)
+# 
+# print( ggplot(df.corr[df.corr$db=="kegg", ], aes(x=x.q, y=y.q)) +
+#          scale_fill_paletteer_d("colorBlindness::ModifiedSpectralScheme11Steps") +
+#          geom_point(alpha=0.1) +
+#          geom_smooth(method=lm , color="red", se=TRUE) +
+#          coord_cartesian(ylim = c(0, 1), xlim = c(0, 1)) +
+#          facet_wrap(~method, scale="free", ncol=4) +
+#          labs(title="Correlation between Q-values for KEGG", #subtitle="n = 8",
+#               x="Apoptosis Q-values", y="CICD Q-values") +
+#          theme.global +
+#          theme(aspect.ratio = 1,
+#                axis.text.x = element_text(angle = 0, vjust = 0.5, hjust = 1))
+#          )
+# 
+# if (save.it) dev.off()
+# 
+# if (save.it) png("P2_outputs/summary_statistics/E2-A Correlations scatter graph 2 camerav1 mrgse.png",
+#                  width = 12, height = 6, units = 'in', res = 400)
+# 
+# print( ggplot(df.corr[df.corr$method=="CAMERAv1" | df.corr$method=="MRGSE", ], aes(x=x.q, y=y.q)) +
+#          scale_fill_paletteer_d("colorBlindness::ModifiedSpectralScheme11Steps") +
+#          geom_point(alpha=0.1) +
+#          geom_smooth(method=lm , color="red", se=TRUE) +
+#          coord_cartesian(ylim = c(0, 1), xlim = c(0, 1)) +
+#          facet_wrap(~method.db, scale="free", ncol=6) +
+#          labs(title="Correlation between Q-values for CAMERAv1 and MRGSE", #subtitle="n = 8",
+#               x="Apoptosis Q-values", y="CICD Q-values") +
+#          theme.global +
+#          theme(aspect.ratio = 1,
+#                axis.text.x = element_text(angle = 0, vjust = 0.5, hjust = 1))
+#          )
+# 
+# if (save.it) dev.off()
+
+```
+
+```{r}
+
+# if (save.it) png("P2_outputs/summary_statistics/E2-A Correlations scatter graph 3 order.png",
+#                  width = 10, height = 18, units = 'in', res = 400)
+# 
+# print( ggplot(df.corr, aes(x=x.o, y=y.o)) +
+#          paletteer::scale_color_paletteer_d("nbapalettes::bulls", direction=-1) +
+#          geom_point(alpha=0.05) +
+#          geom_smooth(method=lm , color="red", fill="green", linewidth=1.5, se=TRUE) +
+#          geom_smooth(method=lm , color="blue", se=TRUE) +
+#          # coord_cartesian(ylim = c(0, 1), xlim = c(0, 1)) +
+#          facet_wrap(~method.db, scale="free", ncol=6) +
+#          labs(title="Relation between Apoptosis and CICD's Q-values' Significance Order", subtitle="(Mixed Dataset)",
+#               x="Apoptosis Q-values", y="CICD Q-values") +
+#          theme.global +
+#          theme(aspect.ratio = 1,
+#                axis.text = element_blank(),
+#                axis.ticks = element_blank()) +
+#          guides(colour = guide_legend(override.aes = list(alpha = 1)))
+#          )
+# 
+# if (save.it) dev.off()
+
+```
+
+```{r}
+
+# if (save.it) png("P2_outputs/summary_statistics/E2-A Correlations scatter graph 3 order log2.png",
+#                  width = 10, height = 18, units = 'in', res = 400)
+# 
+# print( ggplot(df.corr, aes(x=x.t.o, y=y.t.o)) +
+#          scale_fill_manual(values=c(paletteer_d("nbapalettes::lakers")[c(3,1,2)])) +
+#          geom_point(alpha=0.05) +
+#          geom_smooth(method=lm , color="red", fill="green", weight=6, se=TRUE) +
+#          geom_smooth(method=lm , color="blue", se=TRUE) +
+#          # coord_cartesian(ylim = c(0, 1), xlim = c(0, 1)) +
+#          facet_wrap(~method.db, scale="free", ncol=6) +
+#          labs(title="Relation between Apoptosis and CICD's Log2-transformed Q-values' Significance Order", subtitle="(Mixed Dataset)",
+#               x="Apoptosis Q-values", y="CICD Q-values") +
+#          theme.global +
+#          theme(aspect.ratio = 1,
+#                axis.text = element_blank(),
+#                axis.ticks = element_blank()) +
+#          guides(colour = guide_legend(override.aes = list(alpha = 1)))
+#          )
+# 
+# if (save.it) dev.off()
+
+```
+
+```{r}
+
+# if (save.it) png("P2_outputs/summary_statistics/E2-A Correlations scatter graph 3 giant 05.png", 
+#                  width = 10, height = 18, units = 'in', res = 400)
+# 
+# print( ggplot(df.corr, aes(x=x.o, y=y.o, color=a.sig5, alpha=a.sig5)) +
+#          paletteer::scale_color_paletteer_d("nbapalettes::bulls", direction=-1) +
+#          geom_point() + 
+#          scale_alpha_discrete(range = c(0.05, 0.7)) +
+#          # geom_smooth(method=lm , color="blue", se=TRUE) +
+#          # coord_cartesian(ylim = c(0, 1), xlim = c(0, 1)) + 
+#          facet_wrap(~method.db, scale="free", ncol=6) +
+#          labs(title="Relation between Apoptosis and CICD's Q-values' Significance Order", subtitle="(Mixed Dataset)", 
+#               x="Apoptosis Q-values", y="CICD Q-values") +
+#          theme.global + 
+#          theme(aspect.ratio = 1,
+#                axis.text = element_blank(),
+#                axis.ticks = element_blank())
+#          )
+# 
+# if (save.it) dev.off()
+
+```
+
+```{r}
+
+if (save.it) png("P2_outputs/summary_statistics/E2-A Correlations scatter graph 3 order by q value 05 and 10 a1.png", 
+                 width = 6, height = 7, units = 'in', res = 300)
+
+print( ggplot(df.corr[!(df.corr$db %in% c("go", "reactome")) & 
+                        (df.corr$method %in% c("GSA", "PADOG", "MRGSE", "CAMERAv1")), ], 
+              aes(x=x.o, y=y.o, color=a.sig, alpha=a.sig)) +
+         paletteer::scale_color_paletteer_d("nbapalettes::warriors_cny") +
+         geom_point(size=0.75) + 
+         scale_alpha_ordinal(range = c(0.2, 0.9)) +
+         # geom_smooth(method=lm , color="blue", se=TRUE) +
+         # coord_cartesian(ylim = c(0, 1), xlim = c(0, 1)) + 
+         facet_wrap(~method.db, scale="free", ncol=4) +
+         labs(title="Relation between Apoptosis and CICD's Q-values' Significance Order (1)", subtitle="(Mixed Dataset)", 
+              x="Apoptosis Q-values", y="CICD Q-values") +
+         theme.global + 
+         theme(aspect.ratio = 1,
+               axis.text = element_blank(),
+               axis.ticks = element_blank(),
+               plot.title=element_blank(),
+               plot.subtitle=element_blank(),
+               axis.title=element_blank(),
+               axis.text.x=element_blank(),
+               strip.text.x = element_text(size = 7)) +
+         guides(colour = guide_legend(override.aes = list(alpha = 1)))
+         )
+
+if (save.it) dev.off()
+
+
+if (save.it) png("P2_outputs/summary_statistics/E2-A Correlations scatter graph 3 order by q value 05 and 10 a2.png", 
+                 width = 6, height = 7, units = 'in', res = 200)
+
+print( ggplot(df.corr[!(df.corr$db %in% c("go", "reactome")) & 
+                        (df.corr$method %in% c("CAMERAv2", "ROAST", "GSVA", "PLAGE")), ], 
+              aes(x=x.o, y=y.o, color=a.sig, alpha=a.sig)) +
+         paletteer::scale_color_paletteer_d("nbapalettes::warriors_cny") +
+         geom_point(size=0.75) + 
+         scale_alpha_ordinal(range = c(0.2, 1)) +
+         # geom_smooth(method=lm , color="blue", se=TRUE) +
+         # coord_cartesian(ylim = c(0, 1), xlim = c(0, 1)) + 
+         facet_wrap(~method.db, scale="free", ncol=4) +
+         labs(title="Relation between Apoptosis and CICD's Q-values' Significance Order (2)", subtitle="(Mixed Dataset)", 
+              x="Apoptosis Q-values", y="CICD Q-values") +
+         theme.global + 
+         theme(aspect.ratio = 1,
+               axis.text = element_blank(),
+               axis.ticks = element_blank(),
+               plot.title=element_blank(),
+               plot.subtitle=element_blank(),
+               axis.title=element_blank(),
+               axis.text.x=element_blank(),
+               strip.text.x = element_text(size = 7)) +
+         guides(colour = guide_legend(override.aes = list(alpha = 1)))
+         )
+
+if (save.it) dev.off()
+
+```
+
+```{r}
+
+if (save.it) png("P2_outputs/summary_statistics/E2-A Correlations scatter graph 3 order by q value 05 and 10 b.png", 
+                 width = 6, height = 7, units = 'in', res = 250)
+
+print( ggplot(df.corr[(df.corr$db %in% c("go", "reactome")), ], aes(x=x.o, y=y.o, color=a.sig, alpha=a.sig)) +
+         paletteer::scale_color_paletteer_d("nbapalettes::warriors_cny") +
+         geom_point(size=0.75) + 
+         scale_alpha_ordinal(range = c(0.05, 0.5)) +
+         # geom_smooth(method=lm , color="blue", se=TRUE) +
+         # coord_cartesian(ylim = c(0, 1), xlim = c(0, 1)) + 
+         facet_wrap(~method.db, scale="free", ncol=4) +
+         labs(title="Relation between Apoptosis and CICD's Q-values' Significance Order (3)", subtitle="(Mixed Dataset)", 
+              x="Apoptosis Q-values", y="CICD Q-values") +
+         theme.global + 
+         theme(aspect.ratio = 1,
+               axis.text = element_blank(),
+               axis.ticks = element_blank(),
+               plot.title=element_blank(),
+               plot.subtitle=element_blank(),
+               axis.title=element_blank(),
+               axis.text.x=element_blank(),
+               strip.text.x = element_text(size = 8)
+               # strip.background = element_rect(fill=(#scale_color_manual(values=
+               #                    c(paletteer_d("palettetown::starterspairs"),
+               #                      paletteer_d("PNWColors::Cascades") )))
+               ) +
+         guides(colour = guide_legend(override.aes = list(alpha = 1)))
+         )
+
+if (save.it) dev.off()
+
+```
+
+
+```{r}
+
+# if (save.it) png("P2_outputs/summary_statistics/E2-A Correlations scatter graph 3 order by q value 05 and 10 log2.png", 
+#                  width = 10, height = 18, units = 'in', res = 400)
+# 
+# print( ggplot(df.corr, aes(x=x.t.o, y=y.t.o, color=a.sig, alpha=a.sig)) +
+#          paletteer::scale_color_paletteer_d("nbapalettes::lakers", direction=-1) +
+#          # scale_color_manual(values=c(paletteer_d("nbapalettes::lakers",direction=-1)[c(3,1,2)])) +
+#          geom_point() + 
+#          scale_alpha_discrete(range = c(0.05, 0.7, 0.7)) +
+#          # geom_smooth(method=lm , color="blue", se=TRUE) +
+#          # coord_cartesian(ylim = c(0, 1), xlim = c(0, 1)) + 
+#          facet_wrap(~method.db, scale="free", ncol=6) +
+#          labs(title="Relation between Apoptosis and CICD's Log2-transformed Q-values' Significance Order", subtitle="(Mixed Dataset)", 
+#               x="Apoptosis Q-values", y="CICD Q-values") +
+#          theme.global + 
+#          theme(aspect.ratio = 1,
+#                axis.text = element_blank(),
+#                axis.ticks = element_blank()) +
+#          guides(colour = guide_legend(override.aes = list(alpha = 1)))
+#          )
+# 
+# if (save.it) dev.off()
+
+```
+
+```{r}
+
+# df.t <- df.corr
+# for (db in db.list)
+# {
+#   idx <- df.t$db==db
+#   n <- sum(idx)
+#            
+#   df.t[idx, "x.o"] <- df.t[idx, "x.o"] /n
+#   df.t[idx, "y.o"] <- df.t[idx, "y.o"] /n
+# }
+# rm(idx, n)
+# 
+# 
+# # if (save.it) png("P2_outputs/summary_statistics/E2-A Correlations scatter graph 4 giant.png", 
+# #                  width = 10, height = 18, units = 'in', res = 400)
+# # 
+# # #print( ggplot(df.t, aes(x=x.q, y=y.q, color=x.o)) +
+# # print( ggplot(df.t, aes(x=x.q, y=y.q, color=y.o)) +
+# #          scale_colour_gradientn(colours =c("red", "white", "black")) +
+# #          geom_point(alpha=0.10) + 
+# #          # geom_smooth(method=lm , color="blue", se=TRUE) +
+# #          coord_cartesian(ylim = c(0, 1), xlim = c(0, 1)) + 
+# #          facet_wrap(~method.db, scale="free", ncol=6) +
+# #          labs(title="Correlation between Q-values, Coloured by Significance Order", subtitle="(Mixed Dataset)", 
+# #               x="Apoptosis Q-values", y="CICD Q-values") +
+# #          theme.global + 
+# #          theme(aspect.ratio = 1,
+# #                axis.text = element_blank(),
+# #                axis.ticks = element_blank(),
+# #                legend.key.width = unit(1, "in"))
+# #          )
+# # 
+# # if (save.it) dev.off()
+# 
+# 
+# if (save.it) png("P2_outputs/summary_statistics/E2-A Correlations scatter graph 4 giant cropped.png", 
+#                  width = 10, height = 18, units = 'in', res = 400)
+# 
+# x.cutoff <- 0.1
+# y.cutoff <- 0.1
+# 
+# #print( ggplot(df.t[df.t$x.q<=x.cutoff & df.t$y.q<=y.cutoff, ], aes(x=x.q, y=y.q, color=x.o)) +
+# print( ggplot(df.t[df.t$x.q>x.cutoff & df.t$y.q>y.cutoff, ], aes(x=x.q, y=y.q, color=y.o)) +
+#          scale_colour_gradientn(colours =c("red", "white", "black")) +
+#          geom_point(alpha=0.10) + 
+#          # geom_smooth(method=lm , color="blue", se=TRUE) +
+#          #coord_cartesian(ylim = c(0, y.cutoff), xlim = c(0, x.cutoff)) + 
+#          coord_cartesian(ylim = c(0, 1), xlim = c(0, 1)) + 
+#          facet_wrap(~method.db, scale="free", ncol=6) +
+#          labs(title="Correlation between Q-values, Coloured by Significance Order", subtitle="(Mixed Dataset)", 
+#               x="Apoptosis Q-values", y="CICD Q-values") +
+#          theme.global + 
+#          theme(aspect.ratio = 1,
+#                axis.text = element_blank(),
+#                axis.ticks = element_blank(),
+#                legend.key.width = unit(1, "in")) +
+#          guides(colour = guide_legend(override.aes = list(alpha = 1)))
+#          )
+# 
+# if (save.it) dev.off()
+# 
+# rm(df.t)
+
+```
+
+
+
+```{r}
+stop()
+```
+
+
+#### boxplots
+
+```{r}
+# Boxplots across all the experiments and enrichment methods, where each available database-dataset combo is a sample.
+# colour source: https://pmassicotte.github.io/paletteer_gallery/
+
+df.bp <- sim_score_spread(statistic.list[str_detect(names(statistic.list), fixed("(B)"))])
+# df.bp <- df.bp[!(df.bp$method %in% c("ORA", "GSEA", "GLOBATLTEST")), ]
+df.bp <- df.bp[!(df.bp$method %in% c("ORA", "GSEA", "GLOBALTEST")), ]
+
+# df.bp$method <- factor(df.bp$method, c(method.names[!method.names %in% c("GSEA", "GLOBATLTEST")]))
+df.bp$method <- factor(df.bp$method, c(method.names[!method.names %in% c("GSEA", "GLOBALTEST")]))
+
+df.bp$db <- factor(df.bp$db, db.list)
+df.bp$ds <- factor(df.bp$ds, reg.list)
+
+not.in <- c("GSA", "CAMERAv1", "CAMERAv2", "GSVA")
+df.bp$good <- "Correlates Well"
+df.bp$good[df.bp$method %in% not.in] <- "Correlates Poorly"
+df.bp$good <- factor(df.bp$good, c("Correlates Well", "Correlates Poorly"))
+
+```
+
+
+```{r}
+# Correlation transparemcy, determined by human intuition.
+
+df.bp$alpha.p <- 1 # pearsons
+df.bp$alpha.l <- 0.5 # log2 transformed
+df.bp$alpha.s <- 1 # spearmans
+df.bp$alpha <- 0  # the one we will use
+df.bp$alpha2 <- 0.5  # this is for the lines
+
+df.bp[df.bp$method %in% c("GSA", "PADOG", "GSVA"), c("alpha.p", "alpha.l")] <- 0.1
+df.bp[df.bp$method %in% c("CAMERAv1", "CAMERAv2"), c("alpha.p", "alpha.l")] <- 0.4
+
+df.bp[df.bp$method %in% c("CAMERAv1", "CAMERAv2", "GSVA"), c("alpha.s")] <- 0.1
+df.bp[df.bp$method %in% c("GSA", "ROAST"),                 c("alpha.s")] <- 0.4
+
+for (i in 1:nrow(df.bp))
+{
+  # All correlation experiments are visible.
+  if (!str_detect(df.bp$exp[i], fixed("Pearson")))
+    df.bp$alpha[i] <- 1
+  
+  if (str_detect(df.bp$exp[i], fixed("Pearson")))
+    df.bp$alpha[i] <- df.bp$alpha.p[i]
+  if (str_detect(df.bp$exp[i], fixed("log")))
+    df.bp$alpha[i] <- df.bp$alpha.l[i]
+  if (str_detect(df.bp$exp[i], fixed("Spearman")))
+    df.bp$alpha[i] <- df.bp$alpha.s[i]
+}
+
+df.bp$alpha2[df.bp$alpha >= 0.9] <- 1
+df.bp$alpha2[df.bp$alpha <= 0.1] <- 0
+
+```
+
+
+```{r}
+
+# Create the boxplot for the Correlation coefficients.
+if (save.it) png("P2_outputs/summary_statistics/E2-B Correlations exp 1 a1.png", 
+                 width = 8, height = 5, units = 'in', res = 400)
+
+print( ggplot(df.bp[df.bp$sim.type != "Overlap", ], aes(x=method, y=similarity, fill=exp, alpha=alpha, color=factor(alpha2))) +
+         scale_fill_manual(values=c("#F76D5EFF", "#D82632FF", "#A6D96AFF", "#66BD63FF", "#74ADD1FF", "#3FA0FFFF")) +
+         # scale_color_manual(
+         #    values=c(paletteer_d("palettesForR::Gray")[c(floor(rev(sort(unique(df.bp$alpha)))*
+         #                                                    (length(paletteer_d("palettesForR::Gray")))/2))])) +
+         scale_color_manual(values=c("#E1E1E1FF", "#3B3B3BFF", "#000000FF")) +
+         #geom_boxplot(alpha=df.bp[df.bp$sim.type != "Overlap", "alpha2"]) + 
+         geom_boxplot() +
+         coord_cartesian(ylim = c(0, 1)) + #facet_wrap(~sim.type, scale="free") +
+         labs(title="Correlation between Q-values", subtitle="n = 8", 
+              x="Enrichment Method", y="Correlation") +
+         theme.global +
+         theme(plot.title=element_blank(),
+               plot.subtitle=element_blank()) +
+         guides(alpha="none", color="none")
+         )
+
+if (save.it) dev.off()
+
+```
+
+```{r}
+
+if (save.it) png("P2_outputs/summary_statistics/E2-B Correlations exp 1 a2.png", 
+                 width = 8, height = 5, units = 'in', res = 400)
+
+print( ggplot(df.bp[df.bp$sim.type != "Overlap", ], aes(x=method, y=similarity, fill=exp)) +
+         scale_fill_manual(values=c("#F76D5EFF", "#D82632FF", "#A6D96AFF", "#66BD63FF", "#74ADD1FF", "#3FA0FFFF")) +
+         geom_boxplot() +
+         coord_cartesian(ylim = c(0, 1)) + #facet_wrap(~sim.type, scale="free") +
+         labs(title="Correlation between Q-values", subtitle="n = 8", 
+              x="Enrichment Method", y="Correlation") +
+         theme.global +
+         guides(alpha="none", color="none")
+         )
+
+if (save.it) dev.off()
+
+
+```
+
+
+```{r}
+
+if (save.it) png("P2_outputs/summary_statistics/E2-B Correlations exp 1 b.png",
+                 width = 4.5, height = 7, units = 'in', res = 400)
+
+df.t <- df.bp[df.bp$sim.type != "Overlap", ]
+df.t$not.in <- "Dubious"
+df.t[!df.t$method %in% not.in ,"not.in"] <- "Robust"
+df.t[(df.t$method=="PADOG" & str_detect(df.t$exp, fixed("Pearson"))) , "not.in"] <- "Dubious"
+df.t$not.in <- factor(df.t$not.in)
+# df.t$alpha3 <- 1
+# df.t[str_detect(df.t$exp, fixed("log")) , "alpha3"] <- 0.8
+
+print( ggplot(df.t, aes(x=not.in, y=similarity, fill=exp, alpha=not.in)) +#, alpha=alpha3, color=factor(alpha3))) +
+         scale_fill_manual(values=c("#F76D5EFF", "#D82632FF", "#A6D96AFF", "#66BD63FF", "#74ADD1FF", "#3FA0FFFF")) +
+         # scale_color_manual(values=c("#3B3B3BFF", "#000000FF")) +
+         geom_boxplot() +
+         coord_cartesian(ylim = c(0, 1)) + #facet_wrap(~sim.type, scale="free") +
+         labs(title="Correlation between Q-values", subtitle="n = [40, 40, 32]        n = [24, 24, 32]",
+              x="Correlation Method", y="Correlation") +
+         theme.global +
+         theme(axis.text.x = element_text(angle=0),
+               plot.title=element_blank()) +
+         guides(alpha="none", color="none", fill=guide_legend(nrow = 3, byrow=TRUE))
+         )
+
+if (save.it) dev.off()
+
+# rm(df.t)
+
+```
+
+
+```{r}
+
+# if (save.it) png("P2_outputs/summary_statistics/E2-B Correlations exp 1 c.png", 
+#                  width = 4.5, height = 7, units = 'in', res = 400)
+# 
+# df.t <- df.bp[df.bp$sim.type != "Overlap", ]
+# df.t$method <- factor(df.t$method, c(c("ORA", "MRGSE", "CAMERAv1", "CAMERAv2",
+#                                     "GSVA", "GSA", "PADOG", "ROAST", "PLAGE")))
+# 
+# print( ggplot(df.t, aes(x=good, y=similarity, fill=method)) +
+#          scale_fill_manual(values=c(paletteer_d("MetBrewer::Cassatt1")[c(1:4)], "#FCFBF4", 
+#                                     paletteer_d("musculusColors::Bmsurface")[c(2:3)], "#E7D4E8FF", 
+#                                     "#C2A5CFFF")[levels(df.t$method) %in% 
+#                                                    unique(df.t$method)]) +
+#          geom_boxplot() +
+#          coord_cartesian(ylim = c(0, 1)) + #facet_wrap(~good, scale="free") +
+#          labs(title="Correlation between Q-values", subtitle="n = 48", 
+#               x="Enrichment Method", y="Correlation") +
+#          theme.global +
+#          theme(axis.text.x = element_text(angle = 0, vjust = 0.5, hjust = 1)) +
+#          guides(alpha="none", color="none", fill=guide_legend(nrow = 2, byrow=TRUE))
+#          )
+# 
+# if (save.it) dev.off()
+# 
+# rm(df.t)
+
+```
+
+
+```{r}
+# source 1: https://stackoverflow.com/questions/1249548/side-by-side-plots-with-ggplot2
+# source 2: https://stackoverflow.com/questions/65733641/add-legend-between-patchwork-main-title-and-plot-titles
+
+# df.t <- df.bp[df.bp$sim.type != "Overlap", ]
+# df.t <- df.t[!df.t$method %in% not.in ,]
+# df.t <- df.t[-(df.t$method=="PADOG" & str_detect(df.t$exp, fixed("Pearson"))) ,]
+# df.t$alpha3 <- 1
+# df.t[str_detect(df.t$exp, fixed("log")) , "alpha3"] <- 0.8
+# 
+# plot1 <- ( ggplot(df.t, aes(x=exp, y=similarity, fill=exp, alpha=alpha3, color=factor(alpha3))) +
+#          scale_fill_manual(values=c("#F76D5EFF", "#D82632FF", "#A6D96AFF", "#66BD63FF", "#74ADD1FF", "#3FA0FFFF")) +
+#          scale_color_manual(values=c("#3B3B3BFF", "#000000FF")) +
+#          geom_boxplot() +
+#          coord_cartesian(ylim = c(0, 1)) + #facet_wrap(~sim.type, scale="free") +
+#          labs(title="n = 32", 
+#               x="Correlation Method", y="Correlation") +
+#          theme.global +
+#          theme(axis.text.x=element_blank()) +
+#          guides(alpha="none", color="none", fill=guide_legend(nrow = 3, byrow=TRUE))
+#          )
+# 
+# df.t <- df.bp[df.bp$sim.type != "Overlap", ]
+# df.t$method <- factor(df.t$method, c(c("ORA", "MRGSE", "CAMERAv1", "CAMERAv2",
+#                                     "GSVA", "GSA", "PADOG", "ROAST", "PLAGE")))
+# 
+# plot2 <- ( ggplot(df.t, aes(x=good, y=similarity, fill=method)) +
+#          scale_fill_manual(values=c(paletteer_d("MetBrewer::Cassatt1")[c(1:4)], "#FCFBF4", 
+#                                     paletteer_d("musculusColors::Bmsurface")[c(2:3)], "#E7D4E8FF", 
+#                                     "#C2A5CFFF")[levels(df.t$method) %in% 
+#                                                    unique(df.t$method)]) + 
+#          geom_boxplot() +
+#          coord_cartesian(ylim = c(0, 1)) + #facet_wrap(~good, scale="free") +
+#          labs(title="n = 48", 
+#               x="Enrichment Method", y="Correlation") +
+#          theme.global +
+#          theme(axis.text.x = element_text(angle = 0, vjust = 0.5, hjust = 1)) +
+#          guides(alpha="none", color="none", fill=guide_legend(nrow = 2, byrow=TRUE))
+#          )
+# 
+# 
+# if (save.it) png("P2_outputs/summary_statistics/E2-B Correlations exp 1 d.png", 
+#                  width = 9, height = 7, units = 'in', res = 400)
+# guide_area() + (plot1 + plot2) +
+#   plot_layout(guides = "collect", nrow = 2, heights = c(1,10)) +
+#   # plot_annotation(title="Correlation between Q-values") &
+#   plot_annotation(title="") &
+#   theme(legend.position = "top",
+#         legend.box.margin=margin(0, 30, 10, 0),
+#         plot.title = element_text(hjust = 0.5),
+#         plot.subtitle = element_text(hjust = 0.5))
+# if (save.it) dev.off()
+# 
+# rm(plot1, plot2, df.t)
+
+```
+
+
+```{r}
+
+# if (save.it) png("P2_outputs/summary_statistics/E2-B Correlations exp 2 a.png", 
+#                  width = 8, height = 5, units = 'in', res = 400)
+# 
+# print( ggplot(df.bp[df.bp$sim.type != "Overlap", ], aes(x=method, y=similarity, fill=method)) +
+#          scale_fill_manual(values=c(paletteer_d("MetBrewer::Cassatt1")[c(1:4)],
+#                                     "#FCFBF4",
+#                                     paletteer_d("musculusColors::Bmsurface")[c(2:3)],
+#                                     "#E7D4E8FF", "#C2A5CFFF"
+#                                     )) +
+#          geom_boxplot() +
+#          coord_cartesian(ylim = c(0, 1)) + facet_wrap(~db, scale="free") +
+#          labs(title="Correlation between Q-values", subtitle="n = [6, 6, 18, 6, 6, 6]", 
+#               x="Enrichment Method", y="Correlation") +
+#          theme.global +
+#          guides(fill="none")
+#          )
+# 
+# if (save.it) dev.off()
+
+```
+
+```{r}
+
+# if (save.it) png("P2_outputs/summary_statistics/E2-B Correlations exp 2 c.png", 
+#                  width = 8, height = 6, units = 'in', res = 400)
+# 
+# print( ggplot(df.bp[df.bp$sim.type != "Overlap" & 
+#                       df.bp$p.val == "only significant correlation values" & 
+#                       !(df.bp$method %in% not.in), ], 
+#               aes(x=method, y=similarity, fill=method)) +
+#          
+#          scale_fill_manual(values=c(paletteer_d("MetBrewer::Cassatt1")[c(1:4)], "#FCFBF4", 
+#                                     paletteer_d("musculusColors::Bmsurface")[c(2:3)], "#E7D4E8FF", 
+#                                     "#C2A5CFFF")[levels(df.bp$method) %in% 
+#                                                    unique(df.bp$method)[!(unique(df.bp$method) 
+#                                                                           %in% not.in)]]) +
+#          geom_boxplot() +
+#          coord_cartesian(ylim = c(0, 1)) + facet_wrap(~db, scale="free") +
+#          labs(title="Correlation between Q-values", subtitle="n = [3, 3, 9, 3, 3, 3]", 
+#               x="Enrichment Method", y="Correlation") +
+#          theme.global +
+#          guides(fill="none")
+#          )
+# 
+# if (save.it) dev.off()
+
+```
+
+
+
+
+
+
+### E2 Jaccard
+
+```{r}
+
+df.bp$exp <- factor(df.bp$exp, c(c("Top 25%", "Top 50%", "Top 75%"), levels(df.bp$exp) ))
+
+df.bp[df.bp$sim.type == "Overlap" &
+      df.bp$exp=="Top 25% of genesets", "exp"] <- "Top 25%"
+
+df.bp[df.bp$sim.type == "Overlap" &
+      df.bp$exp=="Top 50% of genesets", "exp"] <- "Top 50%"
+
+df.bp[df.bp$sim.type == "Overlap" &
+      df.bp$exp=="Top 75% of genesets", "exp"] <- "Top 75%"
+
+```
+
+
+```{r}
+# Create the boxplot for the Jaccard Indices.
+
+# if (save.it) png("P2_outputs/summary_statistics/E2-C Jaccard Indices 1.png", 
+#                  width = 8, height = 6, units = 'in', res = 400)
+# 
+# print( ggplot(df.bp[df.bp$sim.type == "Overlap", ], aes(x=method, y=similarity, fill=exp)) +
+#          scale_fill_paletteer_d("NineteenEightyR::miami2") +
+#          #scale_fill_manual(values=c("#DAD8A7FF", "#7FC7AFFF", "#3FB8AFFF", "#FF9E9DFF")) +
+#          geom_boxplot() + coord_cartesian(ylim = c(0, 1)) + #facet_wrap(~sim.type, scale="free") +
+#          labs(title="Overlap between Enriched Genesets", subtitle="n = 8",
+#               x="Enrichment Method", y="Overlap") +
+#          theme.global
+#        )
+# 
+# if (save.it) dev.off()
+
+```
+
+```{r}
+
+# if (save.it) png("P2_outputs/summary_statistics/E2-B Jaccard indicies exp 1 b.png", 
+#                  width = 4.5, height = 7, units = 'in', res = 400)
+# 
+# df.t <- df.bp[df.bp$sim.type == "Overlap", ]
+# df.t$method <- factor(df.t$method, c(c("ORA", "MRGSE", "CAMERAv1", "CAMERAv2",
+#                                     "GSVA", "GSA", "PADOG", "ROAST", "PLAGE")))
+# 
+# 
+# print( ggplot(df.t, aes(x=good, y=similarity, fill=method)) +
+#          
+#          scale_fill_manual(values=c(paletteer_d("MetBrewer::Cassatt1")[c(1:4)], "#FCFBF4", 
+#                                     paletteer_d("musculusColors::Bmsurface")[c(2:3)], "#E7D4E8FF", 
+#                                     "#C2A5CFFF")[levels(df.t$method) %in% 
+#                                                    unique(df.t$method)]) +
+#          geom_boxplot() +
+#          coord_cartesian(ylim = c(0, 1)) + #facet_wrap(~good, scale="free") +
+#          labs(title="Overlap between Enriched Genesets", subtitle="n = 32", 
+#               x="Enrichment Method", y="Correlation") +
+#          theme.global +
+#          theme(axis.text.x = element_text(angle = 0, vjust = 0.5, hjust = 1)) +
+#          guides(alpha="none", color="none", fill=guide_legend(nrow = 2, byrow=TRUE))
+#          )
+# 
+# if (save.it) dev.off()
+# 
+# rm(df.t)
+
+```
+
+
+```{r}
+
+# if (save.it) png("P2_outputs/summary_statistics/E2-C Jaccard Indices 1.png", 
+#                  width = 8, height = 6, units = 'in', res = 400)
+
+# print( ggplot(df.bp[df.bp$sim.type == "Overlap", ], aes(x=good, y=similarity, fill=db)) + 
+#          scale_fill_paletteer_d("NineteenEightyR::miami2") +
+#          #scale_fill_manual(values=c("#DAD8A7FF", "#7FC7AFFF", "#3FB8AFFF", "#FF9E9DFF")) +
+#          geom_boxplot() + coord_cartesian(ylim = c(0, 1)) + #facet_wrap(~ds, scale="free") +
+#          labs(title="Overlap between Enriched Genesets", #subtitle="n = 32",
+#               x="Enrichment Method", y="Overlap") +
+#          theme.global
+#        )
+
+# if (save.it) dev.off()
+
+```
+
+
+
+```{r}
+# Create the boxplot for the Jaccard Indices.
+
+# if (save.it) png("P2_outputs/summary_statistics/E2-B Jaccard indicies exp 1 c.png", 
+#                  width = 4.5, height = 7, units = 'in', res = 400)
+# 
+# print( ggplot(df.bp[df.bp$sim.type == "Overlap", ], aes(x=ds, y=similarity, fill=exp)) + 
+#          scale_fill_paletteer_d("NineteenEightyR::miami2") +
+#          # paletteer::scale_fill_paletteer_d("lisa::AndyWarhol") +
+#          geom_boxplot() + coord_cartesian(ylim = c(0, 1)) + #facet_wrap(~sim.type, scale="free") +
+#          labs(title="Overlap between Enriched Genesets", subtitle="n = [48, 8, 8]",
+#               x="Dataset", y="Overlap") +
+#          theme.global
+#        )
+# 
+# if (save.it) dev.off()
+
+```
+
+#### RNG calculator
+
+
+```{r}
+
+prop.mean <- c()
+
+
+for (m in method.names)
+{
+  # for (n in )
+  prop.mean <- c(prop.mean, mean(df.ssc[df.ssc$method==m & df.ssc$ds=="mixed" , "prop.len"]))
+  names(prop.mean)[length(prop.mean)] <- m
+}
+
+prop.mean[[9]] <- 0
+prop.mean <- prop.mean
+
+prop.mean
+
+```
+
+```{r}
+db.len <- t_pose(as.data.frame(table(df.dbs[df.dbs$db!="all","db"])))
+db.len <- db.len[, -1]
+colnames(db.len) <- db.len[1 ,]
+db.len <- db.len[-1, ]
+rownames(db.len)[1] <- "n"
+
+db.len <- t_pose(db.len)
+db.len[, 1] <- as.numeric(db.len[, 1])
+db.len <- t_pose(db.len)
+
+db.len
+
+```
+
+
+```{r}
+
+names     <- c()
+sim.score <- c()
+db.list   <- c()
+exp.list  <- c()
+
+# repeat a bunch.
+for (x in 1:100)
+{
+  # For each method.
+  for (j in 1:length(prop.mean))
+  {
+    
+    # db.len <- rbind(db.len, NA)
+    # rownames(db.len)[nrow(db.len)] <- names(prop.mean)[j]
+    
+    # For each database.
+    for (i in colnames(db.len))
+    {
+      # print(i)
+      m <- db.len["n", i]
+      n <- round((prop.mean[j]/100) * m)
+      
+      a <- sample(1:m, n)
+      b <- sample(1:m, n)
+      # db.len[j+1, i] <- length(comparelists(a, b)$intersect) / length(unique(c(a, b)))
+      
+      #sim.score <- c(sim.score, db.len[j+1, i])
+      for (k in c(0.25, 0.50, 0.75, 1.00))
+      {
+        a.t <- a[1:ceiling(length(a)*k)]
+        b.t <- b[1:ceiling(length(b)*k)]
+        if (sum(is.na(a.t)) > 0 | sum(is.na(b.t)) > 0)
+          jaccard <- 0
+        else
+          jaccard <- length(comparelists(a.t, b.t)$intersect) / length(unique(c(a.t, b.t)))
+        sim.score <- c(sim.score, jaccard)
+      }
+      
+      # print(sim.score)
+      
+      # sim.score <- c(sim.score, rep(db.len[j+1, i]), 4)
+      names    <- c(names,     rep(names(prop.mean)[j], 4))
+      db.list  <- c(db.list,   rep(i, 4))
+      # exp.list <- c(exp.list,  c("Top 25% of genesets", "Top 50% of genesets", 
+      #                             "Top 75% of genesets", "All genesets"))
+      exp.list <- c(exp.list,  c("Top 25%", "Top 50%", "Top 75%", "All genesets"))
+      
+      
+      
+      # print(paste0("names:", length(names), ", sim.score:", length(sim.score), 
+      #              ", db.list:", length(db.list), ", exp.list:", length(exp.list)))
+    }
+  }
+}
+
+# db.len
+df.rand <- data.frame(method=names, similarity=sim.score, exp=exp.list, db=db.list)
+# df.rand[df.rand$method=="GLOBATLTEST", "method"] <- "GLOBALTEST"
+df.rand <- df.rand[!(df.rand$method %in% c("ORA", "GSEA", "GLOBALTEST")), ]
+# df.rand$method <- factor(df.rand$method, c("MRGSE", "CAMERAv1", "CAMERAv2",
+#                                             "GSA", "PADOG", "ROAST", "GSVA", "PLAGE"))
+df.rand$method <- factor(df.rand$method, method.names)
+df.rand$exp <- factor(df.rand$exp, c(unique(df.rand$exp)))
+df.rand$nothing <- "Random Numbers"
+
+df.rand
+
+```
+
+```{r}
+# Create the boxplot for the Jaccard Indices.
+
+if (save.it) png("P2_outputs/summary_statistics/E2-C Jaccard Indices 1 rand.png",
+                width = 7, height = 4.35, units = 'in', res = 400)
+
+n <- max(unique(table(df.rand$method, df.rand$exp)))
+
+print( ggplot(df.rand, aes(x=method, y=similarity, fill=exp)) +
+         paletteer::scale_fill_paletteer_d("lisa::AndyWarhol") +
+         geom_boxplot(outlier.color=NA) + coord_cartesian(ylim = c(0, 1)) + #facet_wrap(~sim.type, scale="free") +
+         labs(title="Overlap between Random Numbers", subtitle=paste0("n = ", n),
+              x="Enrichment Method", y="Overlap") +
+         theme.global +
+         theme(plot.title=element_blank())
+       )
+
+if (save.it) dev.off()
+
+```
+
+
+```{r}
+
+df.t <- df.bp[df.bp$sim.type == "Overlap", names(df.rand)]
+df.t$nothing <- "Enriched Genesets"
+df.t <- rbind(df.t, df.rand)
+
+df.t$method <- factor(df.t$method, method.names)
+df.t$exp    <- factor(df.t$exp,    c(levels(df.t$exp), "Random Overlaps"))
+df.t[df.t$nothing=="Random Numbers", "exp"] <- "Random Overlaps"
+
+if (save.it) png("P2_outputs/summary_statistics/E2-C Jaccard Indices 2.png", 
+                 width = 6, height = 3.75, units = 'in', res = 400)
+
+print( ggplot(df.t, aes(x=method, y=similarity, fill=exp)) + 
+         scale_fill_paletteer_d("NineteenEightyR::miami2") +
+         #scale_fill_manual(values=c("#DAD8A7FF", "#7FC7AFFF", "#3FB8AFFF", "#FF9E9DFF")) +
+         geom_boxplot(outlier.color=NA) + coord_cartesian(ylim = c(0, 1)) + #facet_wrap(~sim.type, scale="free") +
+         # geom_violin() +
+         labs(title="Overlap between Enriched Genesets", subtitle="n = 8",
+              x="Enrichment Method", y="Overlap") +
+         theme.global 
+       )
+
+if (save.it) dev.off()
+
+rm(df.t)
+
+```
+
+```{r}
+
+df.t <- df.bp[df.bp$sim.type == "Overlap", names(df.rand)]
+df.t$nothing <- "Enriched Genesets"
+df.t <- rbind(df.t, df.rand)
+df.t <- df.t[df.t$method=="PLAGE", ]
+
+
+if (save.it) png("P2_outputs/summary_statistics/E2-C Jaccard Indices 3.png", 
+                 width = 4.5, height = 7, units = 'in', res = 400)
+
+print( ggplot(df.t, aes(x=exp, y=similarity, fill=nothing)) + 
+         # scale_fill_paletteer_d("NineteenEightyR::miami2") +
+         # paletteer::scale_fill_paletteer_d("fishualize::Acanthurus_sohal") +
+         paletteer::scale_fill_paletteer_d("palettetown::mew") +
+         geom_boxplot(outlier.color=NA) + coord_cartesian(ylim = c(0, 1)) + #facet_wrap(~nothing, scale="free") +
+         # geom_violin() +
+         labs(title="Overlap between\nPLAGE Genesets", #subtitle="n = 8",
+              x="Enrichment Method", y="Overlap") +
+         theme.global +
+         theme(axis.title.x=element_blank(),
+               axis.text.x=element_blank()) +
+         guides(fill=guide_legend(nrow = 2, byrow=TRUE))
+       )
+
+if (save.it) dev.off()
+
+#rm(df.t)
+
+```
+
+```{r}
+
+
+df.t 
+```
+
+
+
+
+
+
+
+
+### E2 joint
+
+```{r}
+
+# df.t <- df.bp[df.bp$sim.type != "Overlap", ]
+# df.t <- df.t[!df.t$method %in% not.in ,]
+# df.t <- df.t[-(df.t$method=="PADOG" & str_detect(df.t$exp, fixed("Pearson"))) ,]
+# df.t <- df.t[(df.t$p.val == "only significant correlation values"), ]
+# 
+# plot1 <- ( ggplot(df.t, aes(x=ds, y=similarity, fill=exp)) +
+#          # scale_fill_manual(values=c("#F76D5EFF", "#D82632FF", "#A6D96AFF", "#66BD63FF", "#74ADD1FF", "#3FA0FFFF")) +
+#          scale_fill_manual(values=c("#D82632FF", "#66BD63FF", "#3FA0FFFF")) +   
+#          geom_boxplot() +
+#          coord_cartesian(ylim = c(0, 1)) + #facet_wrap(~sim.type, scale="free") +
+#          labs(title="n = [142, 24, 24]", 
+#               y="Correlation") +
+#          theme.global +
+#          guides(alpha="none", color="none", fill=guide_legend(nrow = 3, byrow=TRUE))
+#          )
+# 
+# 
+# plot2 <- ( ggplot(df.bp[df.bp$sim.type == "Overlap", ], aes(x=ds, y=similarity, fill=exp)) + 
+#          scale_fill_paletteer_d("NineteenEightyR::miami2") +
+#          # paletteer::scale_fill_paletteer_d("lisa::AndyWarhol") +
+#          geom_boxplot() + coord_cartesian(ylim = c(0, 1)) + #facet_wrap(~sim.type, scale="free") +
+#          labs(title="n = [24, 4, 4]",
+#               y="Overlap") +
+#          theme.global + guides(fill=guide_legend(nrow = 2, byrow=TRUE))
+#        )
+# 
+# 
+# if (save.it) png("P2_outputs/summary_statistics/E2-D double ds.png", 
+#                  width = 9, height = 7, units = 'in', res = 400)
+# guide_area() + (plot1 + plot2) +
+#   plot_layout(guides = "collect", nrow = 2, heights = c(1,10)) +
+#   # plot_annotation(title="Correlation between Q-values") &
+#   plot_annotation(title="") &
+#   theme(axis.title.x=element_blank(),
+#         legend.position = "top",
+#         legend.box.margin=margin(0, 30, 10, 0),
+#         plot.title = element_text(hjust = 0.5),
+#         plot.subtitle = element_text(hjust = 0.5))
+# if (save.it) dev.off()
+# 
+# rm(plot1, plot2, df.t)
+
+```
+
+```{r}
+
+# df.t <- df.bp[df.bp$sim.type != "Overlap", ]
+# df.t <- df.t[!df.t$method %in% not.in ,]
+# df.t <- df.t[-(df.t$method=="PADOG" & str_detect(df.t$exp, fixed("Pearson"))) ,]
+# df.t <- df.t[(df.t$p.val == "only significant correlation values"), ]
+# 
+# plot1 <- ( ggplot(df.t, aes(x=db, y=similarity, fill=exp)) +
+#          # scale_fill_manual(values=c("#F76D5EFF", "#D82632FF", "#A6D96AFF", "#66BD63FF", "#74ADD1FF", "#3FA0FFFF")) +
+#          scale_fill_manual(values=c("#D82632FF", "#66BD63FF", "#3FA0FFFF")) +   
+#          geom_boxplot() +
+#          coord_cartesian(ylim = c(0, 1)) + #facet_wrap(~sim.type, scale="free") +
+#          labs(title="n = [4, 4, 12, 4, 4, 4]", 
+#               y="Correlation") +
+#          theme.global +
+#          guides(alpha="none", color="none", fill=guide_legend(nrow = 3, byrow=TRUE))
+#          )
+# 
+# 
+# plot2 <- ( ggplot(df.bp[df.bp$sim.type == "Overlap", ], aes(x=db, y=similarity, fill=exp)) + 
+#          scale_fill_paletteer_d("NineteenEightyR::miami2") +
+#          # paletteer::scale_fill_paletteer_d("lisa::AndyWarhol") +
+#          geom_boxplot() + coord_cartesian(ylim = c(0, 1)) + #facet_wrap(~sim.type, scale="free") +
+#          labs(title="n = [8, 8, 24, 8, 8, 8]",
+#               y="Overlap") +
+#          theme.global + guides(fill=guide_legend(nrow = 2, byrow=TRUE))
+#        )
+# 
+# 
+# if (save.it) png("P2_outputs/summary_statistics/E2-D double db.png", 
+#                  width = 9, height = 7, units = 'in', res = 400)
+# guide_area() + (plot1 + plot2) +
+#   plot_layout(guides = "collect", nrow = 2, heights = c(1,10)) +
+#   # plot_annotation(title="Correlation between Q-values") &
+#   plot_annotation(title="") &
+#   theme(axis.title.x=element_blank(),
+#         legend.position = "top",
+#         legend.box.margin=margin(0, 30, 10, 0),
+#         plot.title = element_text(hjust = 0.5),
+#         plot.subtitle = element_text(hjust = 0.5))
+# if (save.it) dev.off()
+# 
+# rm(plot1, plot2, df.t)
+
+```
+
+
+
+
+# End
+```{r}
+stop("You have reached the end of the auto-run code--")
+```
+
+
+# Across Databases
+
+## gather sigsets
+
+```{r}
+# Set up
+
+db_list <- list()
+
+db_list[[length(db_list)+1]] <- "kegg"
+db_list[[length(db_list)+1]] <- "go"
+db_list[[length(db_list)+1]] <- "msigdb-h"
+#bb_list[[length(db_list)+1]] <- "wikipathways"
+db_list[[length(db_list)+1]] <- "reactome"
+db_list[[length(db_list)+1]] <- "mousecyc"
+
+folder <- ""
+#folder <- "_up_reg"
+#folder <- "_down_reg"
+
+df_gene <- read_csv("P1_outputs/df_rep_genelist.csv")
+save.it <- FALSE
+
+```
+
+```{r include=FALSE}
+# Gather sigsets per apoptosis and CICD.
+
+# Collection of genesets (names) and their corresponding genes (values).
+sigsets.a <- list()
+sigsets.c <- list()
+
+# For nicely arragning the hierarchy graph leaf labels.
+order.a <- list()
+order.c <- list()
+
+counter <- 0
+
+for (d in db_list)
+{
+  # Set path.
+  path <- paste0("P2_outputs/", d, "_results", folder,"/")
+  
+  # Read and process the results.
+  a.gsa <- read_csv(paste0(path, "apoptosis_3_GSA.csv"))
+  a.padog <- read_csv(paste0(path, "apoptosis_4_PADOG.csv"))
+  a.mrgse <- read_csv(paste0(path, "apoptosis_5_MRGSE.csv"))
+  a.camera.one <- read_csv(paste0(path, "apoptosis_6_CAMERAv1.csv"))
+  a.camera.two <- read_csv(paste0(path, "apoptosis_7_CAMERAv2.csv"))
+  a.roast <- read_csv(paste0(path, "apoptosis_8_ROAST.csv"))
+  a.gsva <- read_csv(paste0(path, "apoptosis_10_GSVA.csv"))
+  a.plage <- read_csv(paste0(path, "apoptosis_11_PLAGE.csv"))
+  
+  c.gsa <- read_csv(paste0(path, "CICD_3_GSA.csv"))
+  c.padog <- read_csv(paste0(path, "CICD_4_PADOG.csv"))
+  c.mrgse <- read_csv(paste0(path, "CICD_5_MRGSE.csv"))
+  c.camera.one <- read_csv(paste0(path, "CICD_6_CAMERAv1.csv"))
+  c.camera.two <- read_csv(paste0(path, "CICD_7_CAMERAv2.csv"))
+  c.roast <- read_csv(paste0(path, "CICD_8_ROAST.csv"))
+  c.gsva <- read_csv(paste0(path, "CICD_10_GSVA.csv"))
+  c.plage <- read_csv(paste0(path, "CICD_11_PLAGE.csv"))
+  
+  # Translate WikiPathways names
+  if(d == "wikipathways")
+  {
+    pw <- listPathways("Mus musculus")
+    wp_dict <- data.frame(id=pw$id, name=pw$name)
+    
+    a.gsa <- rename_wp(a.gsa, wp_dict)
+    a.padog <- rename_wp(a.padog, wp_dict)
+    a.mrgse <- rename_wp(a.mrgse, wp_dict)
+    a.camera.one <- rename_wp(a.camera.one, wp_dict)
+    a.camera.two <- rename_wp(a.camera.two, wp_dict)
+    a.roast <- rename_wp(a.roast, wp_dict)
+    a.gsva <- rename_wp(a.gsva, wp_dict)
+    a.plage <- rename_wp(a.plage, wp_dict)
+  
+    c.gsa <- rename_wp(c.gsa, wp_dict)
+    c.padog <- rename_wp(c.padog, wp_dict)
+    c.mrgse <- rename_wp(c.mrgse, wp_dict)
+    c.camera.one <- rename_wp(c.camera.one, wp_dict)
+    c.camera.two <- rename_wp(c.camera.two, wp_dict)
+    c.roast <- rename_wp(c.roast, wp_dict)
+    c.gsva <- rename_wp(c.gsva, wp_dict)
+    c.plage <- rename_wp(c.plage, wp_dict)
+    
+  }
+  
+  # Apply listification.
+  
+  a.gsa <- csv_to_eb_list(a.gsa, "GSA", "a")
+  a.padog <- csv_to_eb_list(a.padog, "PADOG", "a")
+  a.mrgse <- csv_to_eb_list(a.mrgse, "MRGSE", "a")
+  a.camera.one <- csv_to_eb_list(a.camera.one, "CAMERAv1", "a")
+  a.camera.two <- csv_to_eb_list(a.camera.two, "CAMERAv2", "a")
+  a.roast <- csv_to_eb_list(a.roast, "ROAST", "a")
+  a.gsva <- csv_to_eb_list(a.gsva, "GSVA", "a")
+  a.plage <- csv_to_eb_list(a.plage, "PLAGE", "a")
+  
+  c.gsa <- csv_to_eb_list(c.gsa, "GSA", "c")
+  c.padog <- csv_to_eb_list(c.padog, "PADOG", "c")
+  c.mrgse <- csv_to_eb_list(c.mrgse, "MRGSE", "c")
+  c.camera.one <- csv_to_eb_list(c.camera.one, "CAMERAv1", "c")
+  c.camera.two <- csv_to_eb_list(c.camera.two, "CAMERAv2", "c")
+  c.roast <- csv_to_eb_list(c.roast, "ROAST", "c")
+  c.gsva <- csv_to_eb_list(c.gsva, "GSVA", "c")
+  c.plage <- csv_to_eb_list(c.plage, "PLAGE", "c")
+  
+  # Assemble the methods.
+  a.sigsets.full <- list(a.gsa, 
+                    a.padog, 
+                    a.mrgse,
+                    a.camera.one, 
+                    a.camera.two, 
+                    a.roast, 
+                    a.gsva, 
+                    a.plage)
+  
+  c.sigsets.full <- list(c.gsa, 
+                    c.padog, 
+                    c.mrgse,
+                    c.camera.one, 
+                    c.camera.two, 
+                    c.roast, 
+                    c.gsva, 
+                    c.plage)
+  
+  a.sigsets.full <- set.names(a.sigsets.full)
+  c.sigsets.full <- set.names(c.sigsets.full)
+  
+  
+  
+  # Generate the significant sigsets based on the methods' overlaps.
+  a.set.super <- comparelists(unlist(get.geneset(list(a.sigsets.full$PLAGE))),
+                                           unlist(get.geneset(list(a.sigsets.full$GSA))))$intersect
+  c.set.super <- comparelists(unlist(get.geneset(list(c.sigsets.full$PLAGE))),
+                                           unlist(get.geneset(list(c.sigsets.full$GSA))))$intersect
+  
+  a <- c((get.geneset(list(a.sigsets.full$PADOG), drop=F)),
+         (get.geneset(list(a.sigsets.full$MRGSE), drop=F)),
+         (get.geneset(list(a.sigsets.full$ROAST), drop=F)),
+         (get.geneset(list(a.sigsets.full$GSVA), drop=F)))
+  
+  c <- c((get.geneset(list(c.sigsets.full$PADOG))),
+         (get.geneset(list(c.sigsets.full$MRGSE))),
+         (get.geneset(list(c.sigsets.full$ROAST))),
+         (get.geneset(list(c.sigsets.full$GSVA))))
+  
+  a.set.sub.two <- c()
+  c.set.sub.two <- c()
+  for (i in 1:3){
+    for (j in (i+1):4){
+      if (!is.null(a[[j]])) if (!is.null(a[[i]])) a.set.sub.two <- c(unique(c(a.set.sub.two, unlist(comparelists(a[[i]], a[[j]])$intersect) )))
+      if (!is.null(c[[j]])) if (!is.null(c[[i]])) c.set.sub.two <- c(unique(c(c.set.sub.two, unlist(comparelists(c[[i]], c[[j]])$intersect) )))
+    }
+  }
+  
+  a.venn.sig <- comparelists(a.set.super, a.set.sub.two)$intersect
+  c.venn.sig <- comparelists(c.set.super, c.set.sub.two)$intersect
+  
+  
+  
+  # mmu.gs synthesis time.
+  if (d == "kegg") mmu.gs <- getGenesets(org="mmu", db="kegg")
+  if (d == "go") mmu.gs <- getGenesets(org="mmu", db="go", onto="BP")
+  if (d == "msigdb-h") mmu.gs <- getGenesets(org="mmu", db="msigdb", cat="H")
+  if (d == "wikipathways") mmu.gs <- get_wikipathways()
+  if (d == "reactome") mmu.gs <- get_reactome()
+  if (d == "mousecyc") mmu.gs <- get_mousecyc()
+  
+  mmu.a <- mmu.gs[which(names(mmu.gs) %in% a.venn.sig)]
+  mmu.c <- mmu.gs[which(names(mmu.gs) %in% c.venn.sig)]
+  
+  
+  # Reassign.
+  if (length(mmu.a) > 0)
+  {
+    for (i in 1:length(mmu.a))
+    {
+      sigsets.a[[length(sigsets.a)+1]] <- mmu.a[[i]]
+      names(sigsets.a)[length(sigsets.a)] <- names(mmu.a)[i]
+    }
+  }
+    
+  if (length(mmu.c) > 0)
+  {
+    for (i in 1:length(mmu.c))
+    {
+      sigsets.c[[length(sigsets.c)+1]] <- mmu.c[[i]]
+      names(sigsets.c)[length(sigsets.c)] <- names(mmu.c)[i]
+    }
+  }
+  
+  counter <- counter + 1
+  order.a <- c(order.a, rep(counter, length(mmu.a)))
+  order.c <- c(order.c, rep(counter, length(mmu.c)))
+  
+}
+
+# Reformat the hierarchical graph leaf ordering sets for ease of use later.
+order.a <- c(unlist(order.a))
+order.c <- c(unlist(order.c))
+
+```
+
+```{r include=FALSE}
+# If we only want the differentially expressed genes, filter out static genes.
+
+sigsets.a.deg <- sigsets.a
+sigsets.c.deg <- sigsets.c
+
+# Set the read path.
+if (folder == "")
+{
+  sig.list.a <- unname(unlist(df_gene[df_gene[which(colnames(df_gene) %in% "Sig_in_A")] == TRUE, "ENTREZID"]))
+  sig.list.c <- unname(unlist(df_gene[df_gene[which(colnames(df_gene) %in% "Sig_in_C")] == TRUE, "ENTREZID"]))
+}
+if (folder == "_up_reg")
+{
+  sig.list.a <- unname(unlist(df_gene[df_gene[which(colnames(df_gene) %in% "upreg.a")] == TRUE, "ENTREZID"]))
+  sig.list.c <- unname(unlist(df_gene[df_gene[which(colnames(df_gene) %in% "upreg.c")] == TRUE, "ENTREZID"]))
+}
+if (folder == "_down_reg")
+{
+  sig.list.a <- unname(unlist(df_gene[df_gene[which(colnames(df_gene) %in% "downreg.a")] == TRUE, "ENTREZID"]))
+  sig.list.c <- unname(unlist(df_gene[df_gene[which(colnames(df_gene) %in% "downreg.c")] == TRUE, "ENTREZID"]))
+}
+
+sig.list.a <- unname(unlist(df_gene[df_gene[which(colnames(df_gene) %in% "Sig_in_A")] == TRUE, "ENTREZID"]))
+sig.list.c <- unname(unlist(df_gene[df_gene[which(colnames(df_gene) %in% "Sig_in_C")] == TRUE, "ENTREZID"]))
+
+# Crop the genesets down the the differentially expressed genes.
+for (i in 1:length(sigsets.a.deg)) sigsets.a.deg[[i]] <- (sigsets.a.deg[[i]])[which(sigsets.a.deg[[i]] %in% sig.list.a)]
+for (i in 1:length(sigsets.c.deg)) sigsets.c.deg[[i]] <- (sigsets.c.deg[[i]])[which(sigsets.c.deg[[i]] %in% sig.list.c)]
+
+```
+
+```{r}
+print(paste0(length(sigsets.a)))
+print(paste0(length(sigsets.c)))
+
+print(paste0(length(unique(unlist(sigsets.a)))))
+print(paste0(length(unique(unlist(sigsets.c)))))
+
+print(paste0(length(unique(unlist(sigsets.a.deg)))))
+print(paste0(length(unique(unlist(sigsets.c.deg)))))
+
+# print(sum(is.na(sigsets.a)))
+# print(sum(is.na(sigsets.c)))
+# print(sum(is.na(sigsets.a.deg)))
+# print(sum(is.na(sigsets.c.deg)))
+
+```
+
+
+
+## hierarchy
+
+```{r}
+
+# Geneate the distance matrix for them.
+temp.a <- distance_matrix(sigsets.a)
+temp.c <- distance_matrix(sigsets.c)
+
+temp.a.deg <- distance_matrix(sigsets.a.deg)
+temp.c.deg <- distance_matrix(sigsets.c.deg)
+
+# Cluster.
+method <- "ward.D"
+#method <- "ward.D2"
+#method <- "average"
+#method <- "complete"
+#method <- "single"
+
+hc.res.a <- hclust(as.dist(temp.a), method=method)
+hc.res.c <- hclust(as.dist(temp.c), method=method)
+
+hc.res.a.deg <- hclust(as.dist(temp.a.deg), method=method)
+hc.res.c.deg <- hclust(as.dist(temp.c.deg), method=method)
+
+```
+
+```{r}
+# Visualise the results.
+
+if (folder != "_down_reg") save.it <- FALSE else save.it <- TRUE
+
+if (!dir.exists("P2_outputs/cluster_graphs")) 
+  dir.create("P2_outputs/cluster_graphs")
+
+
+#par(mar = c(4, 0.5, 0, 15), cex.lab=2, cex.main=2, cex.axis=1, cex.sub=1, cex=0.5)
+# par(mar = c(0, 0, 0, 0))
+par(mar = c(4, 0.5, 2, 30), cex.lab=2, cex.main=2, cex.axis=1, cex.sub=1, cex=0.5)
+    
+if (save.it) png("P2_outputs/cluster_graphs/E4-A full graph downreg (A).png", 
+                 width = 8, height = 5, units = 'in', res = 400)
+plot(colour_branches(color_labels(as.dendrogram(hc.res.a), col=order.a[hc.res.a$order]), k=10), horiz=TRUE, xlim=c(1,0), ylim=NULL, xlab="Distance between Genesets", main="Full Genesets (Apoptosis)")
+if (save.it) dev.off()
+
+
+if (save.it) png("P2_outputs/cluster_graphs/E4-A full graph downreg (A) statics.png", 
+                 width = 8, height = 5, units = 'in', res = 400)
+plot(colour_branches(color_labels(as.dendrogram(hc.res.a.deg), col=order.a[hc.res.a.deg$order]), k=10), horiz=TRUE, xlim=c(1,0), ylim=NULL, xlab="Distance between Genesets", main="Only DEGs in Genesets (Apoptosis)")
+if (save.it) dev.off()
+
+
+if (save.it) png("P2_outputs/cluster_graphs/E4-A full graph downreg (C).png", 
+                 width = 8, height = 5, units = 'in', res = 400)
+#hc.res.c <- hclust(as.dist(temp.c), method="average")
+plot(colour_branches(color_labels(as.dendrogram(hc.res.c), col=order.c[hc.res.c$order]), k=10), horiz=TRUE, xlim=c(1,0), ylim=NULL, xlab="Distance between Genesets", main="Full Genesets (CICD)")
+if (save.it) dev.off()
+
+
+if (save.it) png("P2_outputs/cluster_graphs/E4-A full graph downreg (C) statics.png", 
+                 width = 8, height = 5, units = 'in', res = 400)
+plot(colour_branches(color_labels(as.dendrogram(hc.res.c.deg), col=order.c[hc.res.c.deg$order]), k=10), horiz=TRUE, xlim=c(1,0), ylim=NULL, xlab="Distance between Genesets", main="Only DEGs in Genesets (CICD)")
+if (save.it) dev.off()
+
+
+#plot(colour_branches(as.dendrogram(hc.res.a), k=10), horiz=TRUE, xlim=c(1,0), ylim=c(0,10), xlab="Distance between Genesets (CICD)")
+#plot(colour_branches(as.dendrogram(hc.res.a), k=10), horiz=TRUE, xlim=c(1,0), ylim=c(30,41), xlab="Distance between Genesets (CICD)")
+
+```
+
+```{r}
+unlist(db_list)
+```
+```{r}
+show.trees <- TRUE
+```
+
+```{r}
+if (show.trees)
+{
+  k <- 50
+  temp.a <- hc.res.a#.deg
+  par(mar = c(4, 0.5, 2, 30), cex.lab=2, cex.main=2, cex.axis=1, cex.sub=1, cex=0.5)
+  
+  if (save.it) png("P2_outputs/cluster_graphs/E4-A partial graph 1 downreg (A).png", 
+                   width = 8, height = 5, units = 'in', res = 400)
+  plot(colour_branches(color_labels(as.dendrogram(temp.a), col=order.a[temp.a$order]), k=k), horiz=TRUE, xlim=c(1,0), ylim=c(0,50), xlab="Distance between Genesets", main="Full Genesets (Apoptosis)")
+  if (save.it) dev.off()
+  
+  if (save.it) png("P2_outputs/cluster_graphs/E4-A partial graph 2 downreg (A).png", 
+                   width = 8, height = 5, units = 'in', res = 400)
+  plot(colour_branches(color_labels(as.dendrogram(temp.a), col=order.a[temp.a$order]), k=k), horiz=TRUE, xlim=c(1,0), ylim=c(50,100), xlab="Distance between Genesets", main="Full Genesets (Apoptosis)")
+  if (save.it) dev.off()
+  
+  if (save.it) png("P2_outputs/cluster_graphs/E4-A partial graph 3 downreg (A).png", 
+                   width = 8, height = 5, units = 'in', res = 400)
+  plot(colour_branches(color_labels(as.dendrogram(temp.a), col=order.a[temp.a$order]), k=k), horiz=TRUE, xlim=c(1,0), ylim=c(100,150), xlab="Distance between Genesets", main="Full Genesets (Apoptosis)")
+  if (save.it) dev.off()
+  
+  if (save.it) png("P2_outputs/cluster_graphs/E4-A partial graph 4 downreg (A).png", 
+                   width = 8, height = 5, units = 'in', res = 400)
+  plot(colour_branches(color_labels(as.dendrogram(temp.a), col=order.a[temp.a$order]), k=k), horiz=TRUE, xlim=c(1,0), ylim=c(150,200), xlab="Distance between Genesets", main="Full Genesets (Apoptosis)")
+  if (save.it) dev.off()
+  
+  if (save.it) png("P2_outputs/cluster_graphs/E4-A partial graph 5 downreg (A).png", 
+                   width = 8, height = 5, units = 'in', res = 400)
+  plot(colour_branches(color_labels(as.dendrogram(temp.a), col=order.a[temp.a$order]), k=k), horiz=TRUE, xlim=c(1,0), ylim=c(200,250), xlab="Distance between Genesets", main="Full Genesets (Apoptosis)")
+  if (save.it) dev.off()
+  
+  if (save.it) png("P2_outputs/cluster_graphs/E4-A partial graph 6 downreg (A).png", 
+                   width = 8, height = 5, units = 'in', res = 400)
+  plot(colour_branches(color_labels(as.dendrogram(temp.a), col=order.a[temp.a$order]), k=k), horiz=TRUE, xlim=c(1,0), ylim=c(250,300), xlab="Distance between Genesets", main="Full Genesets (Apoptosis)")
+  if (save.it) dev.off()
+  
+  if (save.it) png("P2_outputs/cluster_graphs/E4-A partial graph 7 downreg (A).png", 
+                   width = 8, height = 5, units = 'in', res = 400)
+  plot(colour_branches(color_labels(as.dendrogram(temp.a), col=order.a[temp.a$order]), k=k), horiz=TRUE, xlim=c(1,0), ylim=c(300,350), xlab="Distance between Genesets", main="Full Genesets (Apoptosis)")
+  if (save.it) dev.off()
+  #plot(colour_branches(color_labels(as.dendrogram(hc.res.a), col=order.a[hc.res.a$order]), k=10), horiz=TRUE, xlim=c(1,0), ylim=c(350,400), xlab="Distance between Genesets (Apoptosis)", main="Full Genesets")
+}
+```
+
+```{r}
+if (show.trees)
+{
+  k <- 50
+  temp.c <- hc.res.c#.deg
+  par(mar = c(4, 0.5, 2, 30), cex.lab=2, cex.main=2, cex.axis=1, cex.sub=1, cex=0.5)
+  plot(colour_branches(color_labels(as.dendrogram(temp.c), col=order.c[temp.c$order]), k=k), horiz=TRUE, xlim=c(1,0), ylim=c(1,50), xlab="Distance between Genesets (CICD)")
+  plot(colour_branches(color_labels(as.dendrogram(temp.c), col=order.c[temp.c$order]), k=k), horiz=TRUE, xlim=c(1,0), ylim=c(50,100), xlab="Distance between Genesets (CICD)")
+  plot(colour_branches(color_labels(as.dendrogram(temp.c), col=order.c[temp.c$order]), k=k), horiz=TRUE, xlim=c(1,0), ylim=c(100,150), xlab="Distance between Genesets (CICD)")
+  plot(colour_branches(color_labels(as.dendrogram(temp.c), col=order.c[temp.c$order]), k=k), horiz=TRUE, xlim=c(1,0), ylim=c(150,200), xlab="Distance between Genesets (CICD)")
+  plot(colour_branches(color_labels(as.dendrogram(temp.c), col=order.c[temp.c$order]), k=k), horiz=TRUE, xlim=c(1,0), ylim=c(200,250), xlab="Distance between Genesets (CICD)")
+  plot(colour_branches(color_labels(as.dendrogram(temp.c), col=order.c[temp.c$order]), k=k), horiz=TRUE, xlim=c(1,0), ylim=c(250,300), xlab="Distance between Genesets (CICD)")
+  plot(colour_branches(color_labels(as.dendrogram(temp.c), col=order.c[temp.c$order]), k=k), horiz=TRUE, xlim=c(1,0), ylim=c(300,350), xlab="Distance between Genesets (CICD)")
+}
+```
+
+```{r}
+which(hc.res.c$order     %in% which(hc.res.c$labels     %in% "Galactose catabolism"))
+which(hc.res.c.deg$order %in% which(hc.res.c.deg$labels %in% "Galactose catabolism"))
+```
+
+
+```{r}
+
+if (folder != "") save.it <- FALSE else save.it <- TRUE
+# which(hc.res.c$order %in% which(hc.res.c$labels %in% "Galactose catabolism"))
+
+if (show.trees)
+{
+  
+  if (save.it) png("P2_outputs/cluster_graphs/E4-A galactose results full.png", 
+                   width = 8, height = 5, units = 'in', res = 400)
+  par(mar = c(4, 0.5, 2, 15), cex.lab=2, cex.main=2, cex.axis=1, cex.sub=1, cex=1)
+  plot(colour_branches(color_labels(as.dendrogram(hc.res.c), 
+                                    col=order.c[hc.res.c$order]), k=100), 
+       horiz=TRUE, xlim=c(1,0), ylim=c(75, 79), edge.root=TRUE, 
+       xlab="Distance between Genesets", main="Full Genesets (CICD)")
+  if (save.it) dev.off()
+  
+  
+  if (save.it) png("P2_outputs/cluster_graphs/E4-A galactose results partial.png", 
+                   width = 8, height = 5, units = 'in', res = 400)
+  par(mar = c(4, 0.5, 2, 15), cex.lab=2, cex.main=2, cex.axis=1, cex.sub=1, cex=1)
+  plot(colour_branches(color_labels(as.dendrogram(hc.res.c.deg), 
+                                    col=order.c[hc.res.c.deg$order]), k=100), 
+       horiz=TRUE, xlim=c(1,0), ylim=c(72, 76), edge.root=TRUE, 
+       xlab="Distance between Genesets", main="Only DEGs in Genesets (CICD)")
+  if (save.it) dev.off()
+}
+```
+```{r}
+(hc.res.c$labels[hc.res.c$order])[53:57]
+```
+
+
+
+
+
+
+## binary matrix
+
+```{r}
+
+# Generate binary matrices.
+df.a <- binary_matrix(sigsets.a)
+df.c <- binary_matrix(sigsets.c)
+
+# Re-arrange genesets by clustering approximity.
+df.a <- df.a[rev(hc.res.a$order), ]
+df.c <- df.c[rev(hc.res.c$order), ]
+
+# Visualise in a heatmap.
+
+Heatmap(as.matrix(df.a), col=c("white", "black"), column_title="Genes", 
+        cluster_rows=FALSE, cluster_columns=FALSE, row_dend_reorder=FALSE, column_dend_reorder=FALSE,
+        column_names_side="top", column_names_rot=-90, show_heatmap_legend = FALSE, show_column_names=FALSE) 
+
+Heatmap(as.matrix(df.c), col=c("white", "black"), column_title="Genes", 
+        cluster_rows=FALSE, cluster_columns=FALSE, row_dend_reorder=FALSE, column_dend_reorder=FALSE,
+        column_names_side="top", column_names_rot=-90, show_heatmap_legend = FALSE, show_column_names=FALSE) 
+
+```
+
+```{r}
+
+# Generate binary matrices.
+df.a <- binary_matrix(sigsets.a.deg)
+df.c <- binary_matrix(sigsets.c.deg)
+
+# Re-arrange genesets by clustering approximity.
+df.a <- df.a[rev(hc.res.a$order), ]
+df.c <- df.c[rev(hc.res.c$order), ]
+
+# Visualise in a heatmap.
+
+Heatmap(as.matrix(df.a), col=c("white", "black"), column_title="Genes", 
+        cluster_rows=FALSE, cluster_columns=FALSE, row_dend_reorder=FALSE, column_dend_reorder=FALSE,
+        column_names_side="top", column_names_rot=-90, show_heatmap_legend = FALSE, show_column_names=FALSE) 
+
+Heatmap(as.matrix(df.c), col=c("white", "black"), column_title="Genes", 
+        cluster_rows=FALSE, cluster_columns=FALSE, row_dend_reorder=FALSE, column_dend_reorder=FALSE,
+        column_names_side="top", column_names_rot=-90, show_heatmap_legend = FALSE, show_column_names=FALSE) 
+
+```
+
+## geneset sized
+
+```{r}
+# Barchart comparing the overall amount of significant genesets found.
+
+#png("P2_outputs/plot_sigsetsize_a.png", width = 10, height = 10, units = 'in', res = 400)
+text(x=barplot(unlist(lapply(sigsets.a, length)), border="deeppink3", #ylim=c(0,length(bg.set)),
+        col="rosybrown1", cex.names=0.75, ylab="Number of Significant Sets Found", xlab="Enrichment Analysis Method (A)"),
+     #labels=(paste0(round(unlist(lapply(sigsets.a, length))*100/length(bg.set)), "%")), cex=1,
+     y=(unlist(lapply(sigsets.a, length))) + 15, col="deeppink3")
+#dev.off()
+
+#png("P2_outputs/plot_sigsetsize_c.png", width = 10, height = 10, units = 'in', res = 400)
+text(x=barplot(unlist(lapply(sigsets.c, length)), border="springgreen4", #ylim=c(0,length(bg.set)),
+        col="palegreen2", cex.names=0.75, ylab="Number of Significant Sets Found", xlab="Enrichment Analysis Method (C)"),
+     #labels=(paste0(round(unlist(lapply(sigsets.c, length))*100/length(bg.set)), "%")), cex=1,
+     y=(unlist(lapply(sigsets.c, length))) + 15, col="springgreen4")
+#dev.off()
+
+```
+
+
+## galactose
+
+```{r}
+
+# Manually assemble THE LIST.
+gal <- c("Galactose catabolism", 
+         "galactose degradation I (Leloir pathway)",
+         "UDP-galactose biosynthesis (salvage pathway from galactose using UDP-glucose)", 
+         "GO:0061623_glycolytic_process_from_galactose", 
+         "GO:0033499_galactose_catabolic_process_via_UDP-galactose")
+
+gal.ind <- which(names(sigsets.c) %in% gal)
+sigsets.gal <- sigsets.c[gal.ind]
+sigsets.gal.deg <- sigsets.c.deg[gal.ind]
+
+sigsets.gal
+print("gap")
+sigsets.gal.deg
+
+```
+
+
+
+
